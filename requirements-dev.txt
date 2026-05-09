@@ -1,0 +1,33 @@
+# Core test framework
+pytest>=8.0.0
+pytest-asyncio>=0.23.0
+pytest-cov>=4.1.0
+pytest-mock>=3.12.0
+pytest-timeout>=2.2.0
+pytest-xdist>=3.5.0           # parallel test execution
+ 
+# Property-based testing (untuk indicators & allocation)
+hypothesis>=6.92.0
+ 
+# Time mocking (untuk schedule, funding window, kill switch)
+freezegun>=1.4.0
+ 
+# HTTP mocking (untuk Anthropic API, Telegram, Hyperliquid REST)
+responses>=0.24.0
+respx>=0.20.0                 # async HTTP mocking (httpx)
+ 
+# Memory profiling (untuk endurance tests)
+memory-profiler>=0.61.0
+psutil>=5.9.0
+ 
+# Static analysis & security
+bandit>=1.7.5
+ruff>=0.1.9
+mypy>=1.8.0
+ 
+# Mutation testing (optional, advanced)
+mutmut>=2.4.0
+ 
+# Test data
+faker>=22.0.0
+factory-boy>=3.3.0

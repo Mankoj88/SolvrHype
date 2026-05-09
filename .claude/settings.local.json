@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pytest --tb=short)",
+      "Bash(pytest tests/ --tb=short)",
+      "Bash(pytest tests/ --collect-only -q)",
+      "Bash(pytest tests/Unit/test_indicators.py tests/Chaos/test_clock_skew.py --collect-only -q)",
+      "WebFetch(domain:drive.google.com)",
+      "PowerShell(Get-Process *)",
+      "Bash(pytest tests/ -q --no-header --tb=line)"
+    ]
+  }
+}

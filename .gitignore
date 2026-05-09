@@ -1,0 +1,27 @@
+# Secrets
+.env
+.env.plain
+.env.age
+*.age
+.solvira-age-key.txt
+
+# Python
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Database
+data/
+*.db
+*.sqlite
+
+# Logs
+logs/
+*.log
+
+# OS & IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
