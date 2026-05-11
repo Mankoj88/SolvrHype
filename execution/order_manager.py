@@ -98,8 +98,15 @@ class OrderManager:
         tmp_path.replace(self.STATE_FILE)
 
     def _reconcile_with_exchange(self):
-        """Bug #5: drop stale local positions that were closed on exchange while bot was offline."""
-        if DRY_RUN or not self.positions:
+        """Bug #5: two-way reconciliation between local state and exchange.
+
+        Direction 1 — drop stale local positions that were closed on exchange
+        while the bot was offline.
+        Direction 2 — import positions open on the exchange but absent from
+        local state (e.g., bot crashed mid-flight). Without this, the bot would
+        forget the position and never place an SL → unbounded loss.
+        """
+        if DRY_RUN:
             return
         try:
             user_state = self.info.user_state(HYPERLIQUID_ACCOUNT)
@@ -169,6 +176,54 @@ class OrderManager:
                     notify_critical_error(
                         f"Cleaned {len(stale_assets)} stale positions on startup: {stale_assets}",
                         "stale_state",
+                    )
+                except Exception:
+                    pass
+
+            # Direction 2: import exchange-only positions so they get an SL.
+            imported_assets = []
+            for asset, exchange_size in exchange_positions.items():
+                if asset in self.positions:
+                    continue
+                pos_data = next(
+                    (p["position"] for p in user_state.get("assetPositions", [])
+                     if p["position"]["coin"] == asset
+                     and float(p["position"]["szi"]) != 0),
+                    None,
+                )
+                if pos_data is None:
+                    continue
+                try:
+                    entry_price = float(pos_data["entryPx"])
+                except (KeyError, ValueError, TypeError):
+                    logger.warning(f"Skipping import of {asset}: missing entryPx")
+                    continue
+                size_coin = abs(float(pos_data["szi"]))
+                sl_price = entry_price * (1 + CUTLOSS_PCT / 100)
+                self.positions[asset] = Position(
+                    asset=asset,
+                    entry_price=entry_price,
+                    entry_size_coin=size_coin,
+                    remaining_size_coin=size_coin,
+                    entry_size_usd=size_coin * entry_price,
+                    entry_time_ms=int(time.time() * 1000),
+                    tp_levels_remaining=list(TAKE_PROFITS),
+                    initial_sl_price=sl_price,
+                    current_sl_price=sl_price,
+                )
+                imported_assets.append(asset)
+                logger.warning(
+                    f"IMPORTED {asset} from exchange: {size_coin} @ "
+                    f"${entry_price:.4f}, will set SL=${sl_price:.4f}"
+                )
+
+            if imported_assets:
+                try:
+                    from notifications.telegram import notify_critical_error
+                    notify_critical_error(
+                        f"Imported {len(imported_assets)} exchange positions on "
+                        f"startup: {imported_assets}",
+                        "startup_import",
                     )
                 except Exception:
                     pass

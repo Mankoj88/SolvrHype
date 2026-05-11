@@ -127,7 +127,7 @@ class WithdrawManager:
         return True
     
     def execute_withdraw(self) -> bool:
-        from notification.telegram import notify_withdrawal, notify_critical_error
+        from notifications.telegram import notify_withdrawal, notify_critical_error
         from monitoring.trade_logger import (
             log_withdrawal_initiated, log_withdrawal_complete, log_withdrawal_failed
         )

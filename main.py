@@ -20,7 +20,7 @@ from execution.withdraw_manager import WithdrawManager
 from monitoring.trade_logger import init_db, log_daily_snapshot, get_daily_stats
 from monitoring.health import HealthMonitor, start_health_server
 from monitoring.stop_loss_enforcer import StopLossEnforcer
-from notification.telegram import (
+from notifications.telegram import (
     notify_startup, notify_shutdown, notify_daily_summary, notify_critical_error
 )
 from self_review.claude_review import run_weekly_review

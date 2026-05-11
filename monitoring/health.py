@@ -9,7 +9,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from typing import Optional
 from loguru import logger
 
-from notification.telegram import notify_circuit_breaker
+from notifications.telegram import notify_circuit_breaker
 from config import (
     MAX_CONSECUTIVE_LOSSES, MAX_DAILY_LOSS_USD, MAX_DAILY_LOSS_PCT
 )

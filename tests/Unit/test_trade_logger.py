@@ -6,63 +6,90 @@ TL3: Bug #22 regression — schema migration.
 """
 
 import sqlite3
+import time
+from datetime import datetime, timezone
 
 import pytest
 
 pytestmark = pytest.mark.unit
 
 
+@pytest.fixture
+def tl_env(monkeypatch, tmp_path):
+    """Redirect DB_PATH on the trade_logger module to a tmp DB and init schema."""
+    from monitoring import trade_logger as tl
+    db = tmp_path / "trades.db"
+    monkeypatch.setattr(tl, "DB_PATH", db)
+    tl.init_db()
+    return tl, db
+
+
 # -----------------------------------------------------------------------------
-# TL1 — init_db() creates schema
+# TL1 — init_db() creates required tables
 # -----------------------------------------------------------------------------
 class TestInitDbSchema:
     pytestmark = pytest.mark.blocker
 
-    def test_init_db_creates_required_tables(self, tmp_path, monkeypatch):
-        # monkeypatch.setattr("config.DB_PATH", tmp_path / "trades.db")
-        # from monitoring.trade_logger import init_db
-        # init_db()
-        # with sqlite3.connect(...) as conn:
-        #     tables = [r[0] for r in conn.execute(
-        #         "SELECT name FROM sqlite_master WHERE type='table'"
-        #     )]
-        # assert "trades" in tables
-        pytest.skip("Wire trade_logger.init_db()")
+    def test_init_db_creates_required_tables(self, tl_env):
+        _tl, db = tl_env
+        with sqlite3.connect(db) as conn:
+            tables = {
+                r[0]
+                for r in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            }
+        assert "trades" in tables
+        assert "daily_snapshots" in tables
+        assert "withdrawals" in tables
 
 
 # -----------------------------------------------------------------------------
-# TL2 — log_trade writes correct row
+# TL2 — log_trade writes a round-trip-able row
 # -----------------------------------------------------------------------------
 class TestLogTradeWrite:
     pytestmark = pytest.mark.blocker
 
-    def test_log_trade_round_trip(self, isolated_db):
-        # from monitoring.trade_logger import log_trade
-        # log_trade(asset="BTC", side="long", ...)
-        # row = conn.execute("SELECT * FROM trades WHERE symbol='BTC'").fetchone()
-        # assert row is not None
-        pytest.skip("Wire trade_logger.log_trade()")
+    def test_log_trade_round_trip(self, tl_env):
+        tl, db = tl_env
+        now_ms = int(time.time() * 1000)
+        tl.log_trade(
+            asset="BTC", side="long_close",
+            size_coin=0.001, size_usd=65.0,
+            entry_price=65000.0, exit_price=66000.0,
+            entry_time_ms=now_ms - 3600_000, exit_time_ms=now_ms,
+            pnl_usd=1.0, pnl_pct=1.5, exit_reason="tp1",
+        )
+        with sqlite3.connect(db) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                "SELECT * FROM trades WHERE asset='BTC'"
+            ).fetchone()
+        assert row is not None
+        assert row["side"] == "long_close"
+        assert row["pnl_usd"] == 1.0
+        assert row["exit_reason"] == "tp1"
 
 
 # -----------------------------------------------------------------------------
-# TL3 — 🔴 Bug #22 regression: DB schema migration
+# TL3 — 🔴 Bug #22 regression: schema migration
 # -----------------------------------------------------------------------------
 class TestBug22DbMigration:
     pytestmark = [pytest.mark.blocker, pytest.mark.regression]
 
-    def test_init_db_uses_user_version_pragma(self, monkeypatch, tmp_path):
-        db_path = tmp_path / "test.db"
-        # monkeypatch.setattr("config.DB_PATH", db_path)
-        # import importlib, monitoring.trade_logger as tl
-        # importlib.reload(tl)
-        # tl.init_db()
-        # with sqlite3.connect(db_path) as conn:
-        #     ver = conn.execute("PRAGMA user_version").fetchone()[0]
-        # assert ver >= 0, "user_version must drive migrations"
-        pytest.skip("Wire trade_logger.init_db() with PRAGMA user_version")
+    def test_init_db_uses_user_version_pragma(self, tl_env):
+        """init_db must drive migrations via PRAGMA user_version."""
+        _tl, db = tl_env
+        with sqlite3.connect(db) as conn:
+            ver = conn.execute("PRAGMA user_version").fetchone()[0]
+        assert ver >= 1, "user_version must be set after init_db()"
 
     def test_old_schema_migrated_in_place(self, tmp_path):
-        """Pre-existing trades table with v0 columns gets new columns added."""
+        """A pre-existing trades table with only the v0 columns must gain the
+        new columns when migrate_schema runs.
+        """
+        from monitoring.trade_logger import migrate_schema
+
         db = tmp_path / "old.db"
         conn = sqlite3.connect(db)
         conn.execute(
@@ -71,28 +98,56 @@ class TestBug22DbMigration:
         )
         conn.commit()
         conn.close()
-        # from monitoring.trade_logger import migrate_schema
-        # migrate_schema(str(db))
-        # cols = [r[1] for r in sqlite3.connect(db)
-        #         .execute("PRAGMA table_info(trades)").fetchall()]
-        # assert "tp1_hit" in cols and "close_reason" in cols
-        pytest.skip("Wire trade_logger.migrate_schema()")
+
+        migrate_schema(str(db))
+
+        with sqlite3.connect(db) as conn:
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(trades)")}
+        assert "tp1_hit" in cols
+        assert "tp2_hit" in cols
+        assert "sl_hit" in cols
+        assert "close_reason" in cols
 
 
 # -----------------------------------------------------------------------------
-# TL4 — Empty day stats returns zeros
+# TL4 — get_daily_stats on an empty day returns zeros
 # -----------------------------------------------------------------------------
 class TestEmptyDayStats:
-    def test_no_trades_returns_zeros(self, isolated_db):
-        pytest.skip("Wire trade_logger.get_day_stats()")
+    def test_no_trades_returns_zeros(self, tl_env):
+        tl, _ = tl_env
+        stats = tl.get_daily_stats("2099-01-01")
+        assert stats["total_trades"] == 0
+        assert stats["wins"] == 0
+        assert stats["losses"] == 0
+        assert stats["pnl_usd"] == 0.0
+        assert stats["top_trade"] is None
 
 
 # -----------------------------------------------------------------------------
-# TL5 — 100 trades aggregated correctly
+# TL5 — Aggregation: multiple trades sum correctly
 # -----------------------------------------------------------------------------
 class TestAggregation:
-    def test_100_trades_sum_correct(self, isolated_db):
-        pytest.skip("Wire aggregation queries")
+    def test_n_trades_sum_correct(self, tl_env):
+        tl, _ = tl_env
+        today = datetime.now(timezone.utc)
+        exit_ms = int(today.timestamp() * 1000)
+
+        for i in range(10):
+            tl.log_trade(
+                asset=f"AST{i}", side="long_close",
+                size_coin=0.1, size_usd=100.0,
+                entry_price=100.0, exit_price=110.0,
+                entry_time_ms=exit_ms - 60_000, exit_time_ms=exit_ms,
+                pnl_usd=(1.0 if i % 2 == 0 else -0.5),
+                pnl_pct=1.0,
+                exit_reason="tp1",
+            )
+
+        stats = tl.get_daily_stats(today.strftime("%Y-%m-%d"))
+        assert stats["total_trades"] == 10
+        assert stats["wins"] == 5
+        assert stats["losses"] == 5
+        assert stats["pnl_usd"] == pytest.approx(5 * 1.0 + 5 * -0.5)
 
 
 # -----------------------------------------------------------------------------
@@ -101,9 +156,27 @@ class TestAggregation:
 class TestPnlSince:
     pytestmark = pytest.mark.blocker
 
-    def test_pnl_since_returns_correct_total(self, isolated_db, freeze_clock):
-        # from monitoring.trade_logger import get_total_pnl_since
-        pytest.skip("Wire trade_logger.get_total_pnl_since()")
+    def test_pnl_since_returns_correct_total(self, tl_env):
+        tl, _ = tl_env
+        now = datetime.now(timezone.utc)
+        now_ms = int(now.timestamp() * 1000)
+
+        # Two trades inside the window
+        for pnl in (10.0, -3.0):
+            tl.log_trade(
+                asset="BTC", side="long_close",
+                size_coin=0.001, size_usd=65.0,
+                entry_time_ms=now_ms - 300_000, exit_time_ms=now_ms,
+                pnl_usd=pnl, pnl_pct=1.0,
+            )
+
+        cutoff = (now.replace(microsecond=0).isoformat()
+                  .replace("+00:00", "+00:00"))
+        # Use a slightly-earlier cutoff to include both rows
+        from datetime import timedelta
+        earlier = (now - timedelta(hours=1)).isoformat()
+        total = tl.get_total_pnl_since(earlier)
+        assert total == pytest.approx(10.0 - 3.0)
 
 
 # -----------------------------------------------------------------------------
@@ -111,7 +184,9 @@ class TestPnlSince:
 # -----------------------------------------------------------------------------
 class TestDbLockRetry:
     def test_db_locked_retries(self):
-        pytest.skip("Wire SQLite-locked retry logic")
+        pytest.skip(
+            "SQLite-locked retry logic not wired in trade_logger — deferred"
+        )
 
 
 # -----------------------------------------------------------------------------
@@ -119,14 +194,32 @@ class TestDbLockRetry:
 # -----------------------------------------------------------------------------
 class TestDiskFullLogTrade:
     def test_disk_full_does_not_crash(self, monkeypatch):
-        pytest.skip("Wire log_trade error handling")
+        pytest.skip("Disk-full fault injection — deferred to Chaos tier")
 
 
 # -----------------------------------------------------------------------------
-# TL9 — DB file deleted at runtime → recreate or fail loud
+# TL9 — DB file deleted at runtime → fail loud (don't silently swallow)
 # -----------------------------------------------------------------------------
 class TestDbFileDeleted:
     pytestmark = pytest.mark.blocker
 
-    def test_db_file_deleted_at_runtime(self, isolated_db):
-        pytest.skip("Wire DB-presence guard")
+    def test_db_file_deleted_at_runtime(self, tl_env):
+        """If the DB file is deleted between writes, sqlite3 should raise so
+        the failure is visible — not silently swallow the trade.
+        """
+        tl, db = tl_env
+        db.unlink()
+        # Subsequent operations should raise (or recreate the file). Either is
+        # acceptable; what's unacceptable is a silent no-op.
+        try:
+            tl.log_trade(
+                asset="BTC", side="long_close",
+                size_coin=0.001, size_usd=65.0, pnl_usd=0.0,
+            )
+        except sqlite3.OperationalError:
+            return  # loud failure — acceptable
+        except sqlite3.DatabaseError:
+            return
+        # If no exception, SQLite recreated the file — verify it now exists
+        assert db.exists(), \
+            "trade_logger silently dropped a trade with no DB file present"

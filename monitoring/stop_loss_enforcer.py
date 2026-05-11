@@ -6,7 +6,7 @@ import json
 from datetime import datetime, timezone, timedelta
 from loguru import logger
 
-from notification.telegram import notify_circuit_breaker
+from notifications.telegram import notify_circuit_breaker
 from monitoring.trade_logger import get_total_pnl_since
 from config import (
     EVALUATION_PERIOD_DAYS, EVALUATION_LOSS_THRESHOLD_USD, DATA_DIR

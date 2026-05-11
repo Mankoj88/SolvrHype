@@ -92,20 +92,42 @@ class TestBug01ScannerLookahead:
     pytestmark = [pytest.mark.blocker, pytest.mark.regression]
 
     def test_scanner_uses_completed_candle_only(
-        self, oversold_setup_df, mock_hl_info
+        self, oversold_setup_df, mock_hl_info, monkeypatch
     ):
         """Bug #1: scanner must use iloc[-2] (closed), not iloc[-1] (forming)."""
-        df_forming = oversold_setup_df.copy()
-        df_forming.iloc[-1, df_forming.columns.get_loc("close")] = 1.0  # extreme
+        from strategy import scanner as scanner_mod
 
-        # from strategy.scanner import MarketScanner
-        # scanner = MarketScanner.__new__(MarketScanner)
-        # scanner.info = mock_hl_info
-        # with patch.object(scanner, "_fetch_candles_df", return_value=df_forming):
-        #     signals = scanner.scan()
-        #     for sig in signals:
-        #         assert sig.price != 1.0, "Bug #1: scanner used forming candle"
-        pytest.skip("Wire MarketScanner.scan() with iloc[-2]")
+        df_forming = oversold_setup_df.copy()
+        sentinel = 1.0
+        df_forming.iloc[-1, df_forming.columns.get_loc("close")] = sentinel
+        expected_price = float(df_forming["close"].iloc[-2])
+
+        # Force the entry-signal predicate True so we can observe which row
+        # scan() routes into the signal payload, independent of indicator math.
+        monkeypatch.setattr(scanner_mod, "is_entry_signal", lambda row: True)
+
+        scanner = scanner_mod.MarketScanner.__new__(scanner_mod.MarketScanner)
+        scanner.info = mock_hl_info
+        scanner._meta_cache = None
+        scanner._meta_cache_time = 0
+        scanner._daily_candles_cache = {}
+
+        monkeypatch.setattr(scanner, "_passes_volume_filter", lambda ctx: True)
+        monkeypatch.setattr(scanner, "_passes_drop_filter", lambda asset: (True, -10.0))
+        monkeypatch.setattr(scanner, "_passes_funding_filter", lambda ctx: True)
+
+        with patch.object(scanner, "_fetch_candles_df", return_value=df_forming):
+            signals = scanner.scan()
+
+        assert signals, "Expected scanner to emit at least one signal"
+        for sig in signals:
+            assert sig.price != sentinel, (
+                f"Bug #1: scanner used forming candle (iloc[-1]={sentinel})"
+            )
+            assert sig.price == pytest.approx(expected_price), (
+                f"signal.price must equal iloc[-2].close={expected_price}, "
+                f"got {sig.price}"
+            )
 
 
 # -----------------------------------------------------------------------------

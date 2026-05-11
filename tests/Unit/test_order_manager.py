@@ -76,17 +76,45 @@ class TestBug02PartialTpSizing:
     pytestmark = pytest.mark.regression
 
     def test_tp2_sells_remaining_size_only(
-        self, mock_hl_exchange, monkeypatch, tmp_path
+        self, mock_hl_exchange, monkeypatch, make_position
     ):
-        """Bug #2: TP2 must sell remaining_size_coin (40%), not original × pct."""
-        # from execution.order_manager import OrderManager, Position
-        # pos = Position(asset="BTC", entry_size_coin=1.0, ...)
-        # pos.remaining_size_coin = 0.4   # after TP1 closed 60%
-        # om._execute_partial_tp("BTC", sell_pct=1.0, tp_pct=20.0,
-        #                        current_price=120.0)
-        # size_arg = mock_hl_exchange.order.call_args[0][2]
-        # assert size_arg == pytest.approx(0.4, abs=1e-5)
-        pytest.skip("Wire OrderManager._execute_partial_tp()")
+        """Bug #2: TP2 must sell remaining_size_coin (40%), not original × pct.
+
+        Live-fill path: force DRY_RUN=False and make market_close return an
+        error so _execute_partial_tp bails before the close-hook side effects.
+        We only need to inspect the size argument passed to the exchange.
+        """
+        monkeypatch.setattr("execution.order_manager.DRY_RUN", False)
+
+        from execution.order_manager import OrderManager, Position
+
+        mock_hl_exchange.market_close.return_value = {
+            "status": "err", "response": "rejected"
+        }
+
+        om = object.__new__(OrderManager)
+        om.exchange = mock_hl_exchange
+        om._szDecimals_cache = {"BTC": 5}
+
+        # TP1 already done: entry=1.0 coin, 60% sold, 0.4 remaining
+        pos = Position.from_dict(make_position(
+            entry_size_coin=1.0,
+            remaining_size_coin=0.4,
+            tp_hit_count=1,
+            tp_levels_remaining=[[20.0, 1.0]],
+        ))
+        om.positions = {pos.asset: pos}
+
+        om._execute_partial_tp(
+            pos.asset, sell_pct=1.0, tp_label=20.0,
+            current_price=pos.entry_price * 1.20, is_last_tp=True,
+        )
+
+        mock_hl_exchange.market_close.assert_called_once()
+        size_arg = mock_hl_exchange.market_close.call_args.kwargs.get("sz")
+        assert size_arg == pytest.approx(0.4, abs=1e-5), (
+            f"Bug #2: TP2 must sell remaining 0.4, got {size_arg}"
+        )
 
 
 # -----------------------------------------------------------------------------
@@ -104,10 +132,56 @@ class TestBreakEvenSlAfterTp1:
 class TestBug03SlFullClose:
     pytestmark = pytest.mark.regression
 
-    def test_sl_closes_all_remaining_size(self, mock_hl_exchange, make_position):
-        # pos with TP1 already hit, remaining_size_coin=0.4
-        # On SL trigger, exchange.market_close should be called with sz=0.4
-        pytest.skip("Wire OrderManager._handle_stop_loss()")
+    def test_sl_closes_all_remaining_size(
+        self, monkeypatch, mock_hl_exchange, make_position, tmp_path
+    ):
+        """Bug #3: SL handler must close pos.remaining_size_coin, never the
+        original entry. Implementation may pass sz=remaining explicitly or omit
+        sz to let HL close-all — both pass. Closing sz=entry_size fails.
+        """
+        import time
+
+        monkeypatch.setattr("execution.order_manager.DRY_RUN", False)
+
+        from execution.order_manager import OrderManager, Position
+
+        om = object.__new__(OrderManager)
+        om.exchange = mock_hl_exchange
+        om._szDecimals_cache = {"BTC": 5}
+        om._cooldown_until = {}
+        om.STATE_FILE = tmp_path / "positions.json"
+        monkeypatch.setattr(om, "_on_position_close_full", lambda *a, **kw: None)
+
+        pos = Position.from_dict(make_position(
+            entry_size_coin=1.0,
+            remaining_size_coin=0.4,
+            entry_time_ms=int(time.time() * 1000) - 60_000,
+            tp_hit_count=1,
+            tp_levels_remaining=[[20.0, 1.0]],
+            entry_price=100.0,
+            initial_sl_price=95.0,
+            current_sl_price=95.0,
+            sl_oid=42,
+        ))
+        om.positions = {pos.asset: pos}
+
+        om.manage_open_positions(current_prices={"BTC": 94.0})
+
+        mock_hl_exchange.market_close.assert_called_once()
+        call = mock_hl_exchange.market_close.call_args
+        sz = call.kwargs.get("sz")
+        if sz is None and len(call.args) >= 2:
+            sz = call.args[1]
+
+        if sz is not None:
+            assert sz == pytest.approx(0.4, abs=1e-5), (
+                f"Bug #3: SL closed sz={sz}, expected remaining=0.4"
+            )
+            assert sz != pytest.approx(1.0, abs=1e-5), (
+                "Bug #3: SL closed full original entry size"
+            )
+
+        assert "BTC" not in om.positions
 
 
 # -----------------------------------------------------------------------------
@@ -193,11 +267,45 @@ class TestConcurrentStateMutation:
 class TestBug05StartupReconciliation:
     pytestmark = pytest.mark.regression
 
-    def test_reconcile_method_exists_and_detects_orphans(self, mock_hl_info):
-        # from execution.order_manager import OrderManager
-        # assert hasattr(OrderManager, "reconcile_with_exchange") or \
-        #        hasattr(OrderManager, "_reconcile_with_exchange")
-        pytest.skip("Wire OrderManager.reconcile_with_exchange()")
+    def test_reconcile_method_exists_and_detects_orphans(
+        self, monkeypatch, mock_hl_info, mock_hl_exchange, make_position, tmp_path
+    ):
+        """Bug #5: OrderManager must expose a startup reconciliation routine
+        that detects local positions which no longer exist on the exchange
+        (orphans) and removes them.
+        """
+        from execution.order_manager import OrderManager, Position
+
+        assert (
+            hasattr(OrderManager, "reconcile_with_exchange")
+            or hasattr(OrderManager, "_reconcile_with_exchange")
+        ), "Bug #5: OrderManager must expose a startup-reconciliation method"
+
+        monkeypatch.setattr("execution.order_manager.DRY_RUN", False)
+
+        om = object.__new__(OrderManager)
+        om.info = mock_hl_info
+        om.exchange = mock_hl_exchange
+        om._szDecimals_cache = {}
+        om._cooldown_until = {}
+        om.STATE_FILE = tmp_path / "positions.json"
+
+        mock_hl_info.user_state.return_value = {
+            "marginSummary": {"accountValue": "1000.0"},
+            "assetPositions": [],
+            "withdrawable": "1000.0",
+        }
+        om.positions = {"BTC": Position.from_dict(make_position())}
+
+        reconcile = (
+            getattr(om, "reconcile_with_exchange", None)
+            or getattr(om, "_reconcile_with_exchange")
+        )
+        reconcile()
+
+        assert "BTC" not in om.positions, (
+            "Bug #5: stale local position not removed during reconcile"
+        )
 
 
 # -----------------------------------------------------------------------------

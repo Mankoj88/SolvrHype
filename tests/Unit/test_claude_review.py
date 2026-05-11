@@ -46,10 +46,9 @@ class TestBug17JsonFenceStripping:
         'Here is the analysis:\n```json\n{"verdict":"ok"}\n```\n',
     ])
     def test_strips_markdown_fences(self, raw):
-        # from self_review.claude_review import parse_review_response
-        # parsed = json.loads(parse_review_response(raw))
-        # assert parsed["verdict"] == "ok"
-        pytest.skip("Wire parse_review_response()")
+        from self_review.claude_review import parse_review_response
+        parsed = json.loads(parse_review_response(raw))
+        assert parsed["verdict"] == "ok"
 
 
 # -----------------------------------------------------------------------------
@@ -59,18 +58,38 @@ class TestHardLimitFiltered:
     pytestmark = pytest.mark.blocker
 
     def test_review_cannot_change_hard_limits(self):
-        # from self_review.claude_review import _sanity_check
-        # suggestion = {"set_max_position_size_usd": 9999}
-        # assert _sanity_check(suggestion) is False
-        pytest.skip("Wire claude_review._sanity_check()")
+        from self_review.claude_review import _sanity_check
+        review = {
+            "suggested_change": {
+                "parameter": "MAX_POSITION_SIZE_USD",
+                "from": 500,
+                "to": 9999,
+            }
+        }
+        result = _sanity_check(review)
+        assert result["suggested_change"].get("blocked") is True
+        # The unsafe `to` value must not survive the sanity filter
+        assert result["suggested_change"].get("to") != 9999
 
 
 # -----------------------------------------------------------------------------
 # CR4 — "annualized return" warning surfaced as risk_alert
 # -----------------------------------------------------------------------------
 class TestAnnualizedReturnWarning:
-    def test_annualized_return_flagged(self, mock_anthropic):
-        pytest.skip("Wire risk_alert detection")
+    def test_annualized_return_flagged(self):
+        """_sanity_check should surface a risk_alert when Claude produced an
+        annualized projection (forbidden per the system prompt).
+        """
+        from self_review.claude_review import _sanity_check
+        review = {
+            "stats": {"total_trades": 7},
+            "patterns": [
+                {"observation": "Trader's annualized return looks like 200%",
+                 "confidence": "low"}
+            ],
+        }
+        result = _sanity_check(review)
+        assert "WARNING" in (result.get("risk_alert") or "")
 
 
 # -----------------------------------------------------------------------------
