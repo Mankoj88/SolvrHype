@@ -40,7 +40,7 @@ MACD_SIGNAL = 9
 VOLUME_SPIKE_LOOKBACK = 3           # 3 candle sebelumnya
 VOLUME_SPIKE_MULTIPLIER = 1.5
 
-# === EXECUTION ===
+# === EXECUTION (DEPRECATED — kept for backward compat during phase 1-3 rollout) ===
 TAKE_PROFITS = [
     (10.0, 0.60),  # +10% sell 60% of remaining (= 60% of original at TP1)
     (20.0, 1.00),  # +20% sell 100% of remaining (= 40% of original, since TP1 sold 60%)
@@ -49,6 +49,53 @@ CUTLOSS_PCT = -5.0
 USE_BREAKEVEN_AFTER_TP1 = True
 MAX_HOLD_HOURS = 6
 SLIPPAGE_TOLERANCE = 0.005
+
+# === DUAL-STRATEGY (new dual spot+derivative architecture) ===
+STRATEGY_POOL_SPLIT = {"spot": 0.50, "derivative": 0.50}
+MAX_OPEN_POSITIONS_PER_STRATEGY = {"spot": 3, "derivative": 2}
+ENABLE_DERIVATIVE_STRATEGY = os.getenv("ENABLE_DERIVATIVE", "false").lower() == "true"
+UNIVERSE_REFRESH_INTERVAL_SECONDS = 3600
+
+SPOT = {
+    "timeframe": "5m",
+    "candle_lookback": 120,
+    "min_7d_avg_daily_volume_usd": 100_000,
+    "min_daily_drop_pct": 2.0,            # -2% vs close kemarin
+    "max_entry_slippage_pct": 0.3,
+    "stoch_rsi_length": 10,
+    "stoch_rsi_k_smooth": 5,
+    "stoch_rsi_d_smooth": 5,
+    "stoch_rsi_oversold": 20,
+    "macd_fast": 12, "macd_slow": 26, "macd_signal": 9,
+    "vol_spike_lookback": 3,
+    "vol_spike_multiplier": 1.5,
+    "cutloss_pct": -2.0,
+    # (tp_pct, sell_fraction_of_remaining, post_action)
+    "take_profits": [(5.0, 0.50, "breakeven"), (10.0, 0.50, None), (20.0, 1.00, None)],
+    "max_hold_hours": 6,
+    "leverage": 1,
+    "allocation_split": [0.30, 0.30, 0.40],  # 1-3 aset
+}
+
+DERIVATIVE = {
+    "timeframe": "5m",
+    "candle_lookback": 120,
+    "oi_flush_lookback_candles": 12,        # 1 jam window (12 × 5m)
+    "oi_flush_drop_pct": 15.0,              # OI turun >15% = flush
+    "cvd_rising_window": 3,                 # 3 × 5m
+    "funding_rate_negative_threshold": -0.0005,  # -0.05% → long setup
+    "funding_rate_positive_threshold": 0.0005,   # +0.05% → short setup
+    "support_resistance_lookback_candles": 96,   # ~8 jam
+    "support_resistance_pivot_window": 5,
+    "support_proximity_pct": 0.01,          # ±1% dari S/R level
+    "swing_lookback_candles": 20,
+    "swing_pivot_window": 5,
+    "structure_break_buffer_pct": 0.005,    # 0.5% buffer
+    "risk_per_trade_pct": 1.5,              # % dari TOTAL equity
+    "max_leverage": 5,
+    "take_profits": [(5.0, 0.50, "breakeven"), (10.0, 0.50, None), (20.0, 1.00, None)],
+    "max_hold_hours": 6,
+}
 
 # === RISK MANAGEMENT [HARD LIMITS — DO NOT MODIFY] ===
 MAX_POSITION_SIZE_USD = 500
@@ -90,6 +137,14 @@ COOLDOWN_AFTER_CLOSE_MINUTES = 60  # cooldown per asset setelah posisi close
 
 # === BRIDGE ===
 HL_BRIDGE_FEE_USD = 1.0  # Hyperliquid bridge withdrawal fee (flat $1)
+
+# === UNIFIED WALLET (perp + spot) ===
+# Bot trading hanya di PERP (spot strategy = perp 1x, deriv = perp ≤5x).
+# Karena itu USDC di spot wallet harus di-sweep ke perp supaya bisa dipakai
+# sebagai margin. Hyperliquid Spot ↔ Perp transfer internal gratis.
+AUTO_SWEEP_SPOT_TO_PERP = os.getenv("AUTO_SWEEP_SPOT_TO_PERP", "true").lower() == "true"
+MIN_SPOT_SWEEP_USD = float(os.getenv("MIN_SPOT_SWEEP_USD", "1.0"))
+SPOT_SWEEP_INTERVAL_MINUTES = int(os.getenv("SPOT_SWEEP_INTERVAL_MINUTES", "15"))
 
 # === WITHDRAWAL ===
 WITHDRAW_PROFIT_PCT = 0.50             # 50% profit ke USDT-Arbitrum

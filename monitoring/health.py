@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from threading import Thread, Lock
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from typing import Optional
+from urllib.parse import urlparse, parse_qs
 from loguru import logger
 
 from notifications.telegram import notify_circuit_breaker
@@ -121,21 +122,57 @@ class HealthMonitor:
 
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        if self.path == "/health":
+        parsed = urlparse(self.path)
+        path = parsed.path
+
+        if path == "/health":
             monitor = HealthMonitor()
             data = monitor.to_dict()
-            
+
             seconds_since_loop = data.get("seconds_since_last_loop")
             is_alive = seconds_since_loop is None or seconds_since_loop < 300
-            
+
             self.send_response(200 if is_alive else 503)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
             self.wfile.write(json.dumps(data).encode())
+        elif path == "/trades":
+            self._handle_trades(parse_qs(parsed.query))
         else:
             self.send_response(404)
             self.end_headers()
-    
+
+    def _handle_trades(self, qs: dict):
+        try:
+            from monitoring.trade_logger import get_recent_trades
+            days = int(qs.get("days", ["7"])[0])
+            strategy = qs.get("strategy", [None])[0]
+            if strategy not in (None, "spot", "derivative"):
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({
+                    "error": "invalid strategy filter; use 'spot' or 'derivative'"
+                }).encode())
+                return
+            trades = get_recent_trades(days_back=days, strategy_type=strategy)
+            payload = {
+                "days_back": days,
+                "strategy_filter": strategy,
+                "count": len(trades),
+                "trades": trades,
+            }
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps(payload, default=str).encode())
+        except Exception as e:
+            logger.exception(f"/trades endpoint error: {e}")
+            self.send_response(500)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": str(e)}).encode())
+
     def log_message(self, format, *args):
         pass
 

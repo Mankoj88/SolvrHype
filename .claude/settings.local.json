@@ -37,7 +37,19 @@
       "Bash(powershell -Command \".venv\\\\Scripts\\\\python.exe -m pytest tests/Unit/test_stop_loss_enforcer.py tests/Unit/test_tax_logger.py -v 2>&1 | Select-Object -Last 35\")",
       "Bash(powershell -Command \".venv\\\\Scripts\\\\python.exe -m pytest -q 2>&1 | Select-String -Pattern 'passed|failed|error' | Select-Object -Last 1\")",
       "Bash(powershell -Command \".venv\\\\Scripts\\\\python.exe -m pytest tests/Unit/test_trade_logger.py -v 2>&1 | Select-Object -Last 25\")",
-      "Bash(powershell -Command \".venv\\\\Scripts\\\\python.exe -m pytest tests/Unit/test_claude_review.py -v 2>&1 | Select-Object -Last 20\")"
+      "Bash(powershell -Command \".venv\\\\Scripts\\\\python.exe -m pytest tests/Unit/test_claude_review.py -v 2>&1 | Select-Object -Last 20\")",
+      "Bash(Select-Object -First 30)",
+      "Bash(grep -E \"\\\\.py$|^d\")",
+      "Bash(xargs grep -l \"api\\\\|endpoint\\\\|flask\\\\|fastapi\")",
+      "Bash(ls \"C:\\\\Users\\\\GT-Laptop-03\\\\.claude\\\\plans\" 2>&1)",
+      "Read(//c/Users/GT-Laptop-03/.claude/plans/**)",
+      "Bash(python -c \"import config; print\\('SPOT:', config.SPOT['timeframe'], config.SPOT['cutloss_pct']\\); print\\('DERIV:', config.DERIVATIVE['risk_per_trade_pct']\\); print\\('Split:', config.STRATEGY_POOL_SPLIT\\); print\\('Enable deriv:', config.ENABLE_DERIVATIVE_STRATEGY\\)\")",
+      "Bash(python -c \"from strategy.base_strategy import TradeSignal, BaseStrategy; sig = TradeSignal\\(asset='BTC', price=100.0, timestamp_ms=1, reason='x', indicators_snapshot={}\\); print\\('TradeSignal default:', sig.strategy_type, sig.leverage, sig.is_long, sig.sl_mode\\)\")",
+      "Bash(python -c ' *)",
+      "Bash(python -m pytest tests/ -x --tb=short -q)",
+      "Bash(python -c \"from hyperliquid.info import Info; print\\([m for m in dir\\(Info\\) if not m.startswith\\('_'\\)]\\)\")",
+      "Bash(python -c \"from hyperliquid.exchange import Exchange; print\\([m for m in dir\\(Exchange\\) if not m.startswith\\('_'\\) and \\('transfer' in m.lower\\(\\) or 'usd' in m.lower\\(\\) or 'spot' in m.lower\\(\\)\\)]\\)\")",
+      "Bash(python -X utf8 -c ' *)"
     ]
   }
 }

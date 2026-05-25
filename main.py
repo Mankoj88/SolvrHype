@@ -12,11 +12,15 @@ from hyperliquid.info import Info
 from config import (
     DRY_RUN, USE_TESTNET, LOGS_DIR, MAX_OPEN_POSITIONS, get_api_url,
     HYPERLIQUID_ACCOUNT, INITIAL_CAPITAL_USD,
+    MAX_OPEN_POSITIONS_PER_STRATEGY, ENABLE_DERIVATIVE_STRATEGY,
+    AUTO_SWEEP_SPOT_TO_PERP, SPOT_SWEEP_INTERVAL_MINUTES,
 )
-from strategy.scanner import MarketScanner
+from strategy.spot_strategy import SpotStrategy
+from strategy.universe import UniverseFetcher
 from execution.order_manager import OrderManager
 from execution.allocation_manager import AllocationManager
 from execution.withdraw_manager import WithdrawManager
+from execution.wallet import WalletReader
 from monitoring.trade_logger import init_db, log_daily_snapshot, get_daily_stats
 from monitoring.health import HealthMonitor, start_health_server
 from monitoring.stop_loss_enforcer import StopLossEnforcer
@@ -45,23 +49,48 @@ logger.add(
 class Solvira:
     def __init__(self):
         self.info = Info(get_api_url(), skip_ws=True)
-        self.scanner = MarketScanner()
+        self.universe = UniverseFetcher(self.info)
+        self.spot_strategy = SpotStrategy(self.info, self.universe)
+        self.derivative_strategy = None
+        if ENABLE_DERIVATIVE_STRATEGY:
+            try:
+                from strategy.derivative_strategy import DerivativeStrategy
+                self.derivative_strategy = DerivativeStrategy(self.info, self.universe)
+                logger.info("Derivative strategy ENABLED")
+            except ImportError as e:
+                logger.warning(f"Derivative strategy not available yet: {e}")
         self.order_manager = OrderManager()
         self.allocation_manager = AllocationManager()
         self.withdraw_manager = WithdrawManager()
+        self.wallet = WalletReader(
+            info=self.info, exchange=self.order_manager.exchange,
+            account=HYPERLIQUID_ACCOUNT,
+        )
         self.health = HealthMonitor()
         self.stop_loss_enforcer = StopLossEnforcer(initial_capital=INITIAL_CAPITAL_USD)
         self._schedule_stop = threading.Event()  # Bug #13
 
-        # Sync existing positions ke allocation manager
+        # Sync existing positions ke allocation manager (per strategy_type)
         for asset, pos in self.order_manager.positions.items():
-            self.allocation_manager.reserve(asset, pos.entry_size_usd)
-    
+            self.allocation_manager.reserve(asset, pos.entry_size_usd, pos.strategy_type)
+
+        # Sweep startup: USDC di spot wallet → perp supaya tersedia sebagai margin
+        if AUTO_SWEEP_SPOT_TO_PERP:
+            try:
+                swept = self.wallet.auto_sweep_spot_to_perp()
+                if swept:
+                    logger.info(f"Startup sweep: ${swept:.2f} USDC spot → perp")
+            except Exception as e:
+                logger.warning(f"Startup sweep failed: {e}")
+
     def get_total_capital(self) -> float:
+        """Total tradeable equity = perp accountValue + spot USDC (yang akan di-sweep).
+        Spot tokens TIDAK termasuk karena tidak liquid sebagai margin perp."""
         try:
-            user_state = self.info.user_state(HYPERLIQUID_ACCOUNT)
-            margin_summary = user_state.get("marginSummary", {})
-            return float(margin_summary.get("accountValue", 0))
+            bal = self.wallet.get_unified_balance()
+            # Capital yang RELEVAN untuk sizing trade perp = perp_equity + spot_usdc
+            # (spot_usdc akan otomatis tersapu ke perp via auto_sweep).
+            return bal.perp_equity + bal.spot_usdc
         except Exception as e:
             logger.warning(f"Failed to fetch capital: {e}")
             return 0
@@ -102,26 +131,45 @@ class Solvira:
             current_prices = self.get_current_prices(assets)
             self.order_manager.manage_open_positions(current_prices)
         
-        # 2. Scan untuk new signals
+        # 2. Scan dual strategy paralel
         self.health.open_positions_count = self.order_manager.open_position_count()
-        if self.health.open_positions_count < MAX_OPEN_POSITIONS:
-            signals = self.scanner.scan()
-            
-            for signal in signals:
-                size_usd = self.allocation_manager.calculate_position_size(
-                    signal.asset, capital, self.health.open_positions_count
-                )
-                if size_usd <= 0:
+        open_by_strat = self.order_manager.open_position_count_by_strategy()
+
+        scan_tasks = []
+        if open_by_strat.get("spot", 0) < MAX_OPEN_POSITIONS_PER_STRATEGY["spot"]:
+            scan_tasks.append(("spot", asyncio.to_thread(self.spot_strategy.scan)))
+        if (self.derivative_strategy is not None
+                and open_by_strat.get("derivative", 0) < MAX_OPEN_POSITIONS_PER_STRATEGY["derivative"]):
+            scan_tasks.append(("derivative", asyncio.to_thread(self.derivative_strategy.scan)))
+
+        all_signals = []
+        if scan_tasks:
+            results = await asyncio.gather(
+                *(t for _, t in scan_tasks), return_exceptions=True
+            )
+            for (label, _), result in zip(scan_tasks, results):
+                if isinstance(result, Exception):
+                    logger.warning(f"{label} scan failed: {result}")
                     continue
-                
-                success = self.order_manager.execute_entry(signal, size_usd)
-                if success:
-                    self.allocation_manager.reserve(signal.asset, size_usd)
-                    self.health.open_positions_count += 1
-                    self.health.last_signal_time = time.time()
-                    
-                    if self.health.open_positions_count >= MAX_OPEN_POSITIONS:
-                        break
+                all_signals.extend(result)
+
+        for signal in all_signals:
+            if self.health.open_positions_count >= MAX_OPEN_POSITIONS:
+                break
+            size_usd = self.allocation_manager.calculate_position_size(
+                asset=signal.asset,
+                total_capital=capital,
+                strategy_type=signal.strategy_type,
+                signal=signal,
+            )
+            if size_usd <= 0:
+                continue
+
+            success = self.order_manager.execute_entry(signal, size_usd)
+            if success:
+                self.allocation_manager.reserve(signal.asset, size_usd, signal.strategy_type)
+                self.health.open_positions_count += 1
+                self.health.last_signal_time = time.time()
         
         # 3. Withdraw threshold check
         if self.withdraw_manager.should_withdraw():
@@ -142,6 +190,8 @@ class Solvira:
         schedule.every().day.at("23:59").do(self._daily_summary_job)
         schedule.every().monday.at("09:00").do(self._weekly_review_job)
         schedule.every().day.at("00:05").do(self._daily_snapshot_job)
+        if AUTO_SWEEP_SPOT_TO_PERP:
+            schedule.every(SPOT_SWEEP_INTERVAL_MINUTES).minutes.do(self._wallet_sweep_job)
 
         # Bug #13: schedule runs in its own thread — won't block trading cycle
         schedule_thread = threading.Thread(
@@ -172,11 +222,23 @@ class Solvira:
     def _daily_summary_job(self):
         try:
             stats = get_daily_stats()
-            stats["capital"] = self.get_total_capital()
-            stats["usdt_wallet"] = self.withdraw_manager.state.get("cumulative_profit_pending", 0)
+            bal = self.wallet.get_unified_balance(force_refresh=True)
+            stats["capital"] = bal.perp_equity + bal.spot_usdc
+            stats["balance"] = bal.to_dict()
+            stats["pending_withdraw"] = self.withdraw_manager.state.get(
+                "cumulative_profit_pending", 0
+            )
             notify_daily_summary(stats)
         except Exception as e:
             logger.exception(f"Daily summary failed: {e}")
+
+    def _wallet_sweep_job(self):
+        try:
+            swept = self.wallet.auto_sweep_spot_to_perp()
+            if swept:
+                logger.info(f"Scheduled sweep: ${swept:.2f} USDC spot → perp")
+        except Exception as e:
+            logger.exception(f"Wallet sweep job failed: {e}")
     
     def _weekly_review_job(self):
         try:

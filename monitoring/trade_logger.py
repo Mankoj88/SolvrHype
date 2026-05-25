@@ -28,6 +28,9 @@ CREATE TABLE IF NOT EXISTS trades (
     exit_reason TEXT,
     indicators_snapshot TEXT,
     notes TEXT,
+    strategy_type TEXT DEFAULT 'spot',
+    leverage INTEGER DEFAULT 1,
+    entry_swing_price REAL,
     created_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -89,9 +92,23 @@ def init_db():
                 pass  # column already exists
             conn.execute("PRAGMA user_version = 1")
 
-        # Add future migrations here as version < N blocks
+        if version < 2:
+            # v2: dual-strategy columns
+            for sql in [
+                "ALTER TABLE trades ADD COLUMN strategy_type TEXT DEFAULT 'spot'",
+                "ALTER TABLE trades ADD COLUMN leverage INTEGER DEFAULT 1",
+                "ALTER TABLE trades ADD COLUMN entry_swing_price REAL",
+            ]:
+                try:
+                    conn.execute(sql)
+                except sqlite3.OperationalError:
+                    pass  # column already exists
+            conn.execute("PRAGMA user_version = 2")
 
-    logger.info(f"Database initialized (schema v{max(version, 1)}): {DB_PATH}")
+        # Add future migrations here as version < N blocks
+        final_version = conn.execute("PRAGMA user_version").fetchone()[0]
+
+    logger.info(f"Database initialized (schema v{final_version}): {DB_PATH}")
 
 
 def migrate_schema(db_path: str):
@@ -116,25 +133,28 @@ def migrate_schema(db_path: str):
 
 def log_trade(asset, side, size_coin, size_usd, entry_price=None, exit_price=None,
               entry_time_ms=None, exit_time_ms=None, pnl_usd=None, pnl_pct=None,
-              fees_usd=0, exit_reason=None, indicators_snapshot=None, notes=None):
+              fees_usd=0, exit_reason=None, indicators_snapshot=None, notes=None,
+              strategy_type="spot", leverage=1, entry_swing_price=None):
     entry_time = (datetime.fromtimestamp(entry_time_ms/1000, tz=timezone.utc).isoformat()
                   if entry_time_ms else None)
     exit_time = (datetime.fromtimestamp(exit_time_ms/1000, tz=timezone.utc).isoformat()
                  if exit_time_ms else None)
     duration = (int((exit_time_ms - entry_time_ms) / 1000)
                 if (exit_time_ms and entry_time_ms) else None)
-    
+
     with _conn() as conn:
         conn.execute("""
             INSERT INTO trades (
                 asset, side, entry_price, exit_price, size_coin, size_usd,
                 entry_time_utc, exit_time_utc, hold_duration_seconds,
                 pnl_usd, pnl_pct, fees_usd, exit_reason,
-                indicators_snapshot, notes
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                indicators_snapshot, notes,
+                strategy_type, leverage, entry_swing_price
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (asset, side, entry_price, exit_price, size_coin, size_usd,
               entry_time, exit_time, duration, pnl_usd, pnl_pct, fees_usd, exit_reason,
-              json.dumps(indicators_snapshot) if indicators_snapshot else None, notes))
+              json.dumps(indicators_snapshot) if indicators_snapshot else None, notes,
+              strategy_type, leverage, entry_swing_price))
 
 
 def log_daily_snapshot(capital_usd, open_positions_count, open_positions_value_usd,
@@ -177,13 +197,20 @@ def log_withdrawal_failed(withdrawal_id: int, error: str):
         """, (error, withdrawal_id))
 
 
-def get_recent_trades(days_back: int = 7) -> list[dict]:
+def get_recent_trades(days_back: int = 7, strategy_type: str = None) -> list[dict]:
     cutoff = datetime.now(timezone.utc).timestamp() - days_back * 86400
     cutoff_iso = datetime.fromtimestamp(cutoff, tz=timezone.utc).isoformat()
     with _conn() as conn:
-        rows = conn.execute("""
-            SELECT * FROM trades WHERE entry_time_utc >= ? ORDER BY entry_time_utc DESC
-        """, (cutoff_iso,)).fetchall()
+        if strategy_type:
+            rows = conn.execute("""
+                SELECT * FROM trades
+                WHERE entry_time_utc >= ? AND strategy_type = ?
+                ORDER BY entry_time_utc DESC
+            """, (cutoff_iso, strategy_type)).fetchall()
+        else:
+            rows = conn.execute("""
+                SELECT * FROM trades WHERE entry_time_utc >= ? ORDER BY entry_time_utc DESC
+            """, (cutoff_iso,)).fetchall()
         return [dict(r) for r in rows]
 
 

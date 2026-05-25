@@ -79,6 +79,9 @@ def run_weekly_review() -> dict:
         {
             "id": t["id"],
             "asset": t["asset"],
+            "strategy": t.get("strategy_type", "spot"),
+            "side": t.get("side"),
+            "leverage": t.get("leverage", 1),
             "entry_t": t["entry_time_utc"],
             "exit_t": t["exit_time_utc"],
             "pnl_pct": t["pnl_pct"],
@@ -88,13 +91,20 @@ def run_weekly_review() -> dict:
         }
         for t in trades
     ]
-    
+
+    grouped = {"spot": [], "derivative": []}
+    for t in compact_trades:
+        grouped.setdefault(t["strategy"], []).append(t)
+
     client = anthropic.Anthropic(api_key=api_key)
-    user_message = f"""Trade log (last 7 days, {len(trades)} trades):
+    user_message = f"""Trade log (last 7 days, {len(trades)} trades total).
+SPOT trades ({len(grouped.get('spot', []))}):
+{json.dumps(grouped.get('spot', []), indent=1)}
 
-{json.dumps(compact_trades, indent=1)}
+DERIVATIVE trades ({len(grouped.get('derivative', []))}):
+{json.dumps(grouped.get('derivative', []), indent=1)}
 
-Analyze and respond with JSON per spec."""
+Analyze each strategy separately when patterns differ. Respond with JSON per spec."""
     
     try:
         response = client.messages.create(
