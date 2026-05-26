@@ -1,16 +1,15 @@
 """
 SpotStrategy — spot long-only di Hyperliquid Perp leverage 1x.
 
-Pipeline (per spec user):
-  universe (dinamis) →
-  filter 7d avg daily volume >$100K →
-  filter funding rate safe (reuse rule lama) →
-  fetch 5m candles (lookback 120) →
-  filter daily drop >-2% vs close kemarin →
-  compute Stoch RSI 10/5/5 + MACD + volume spike vs 3 candle →
-  entry condition: K>D & both<20 & MACD hist neg→pos & vol spike →
-  emit TradeSignal(strategy_type="spot", leverage=1, sl_mode="pct", is_long=True)
-Return max 3 signal.
+ARCHITECTURE (rate-limit safe):
+  Stage 1 — ctx-only pre-filter (0 API call per asset):
+    funding window + dayNtlVlm + drop = markPx/prevDayPx-1
+  Stage 2 — top-N survivors only:
+    sort by drop_pct ASC → cap at MAX_CANDIDATES_PER_CYCLE
+    fetch 5m candles → indicators → signals
+
+Sebelum refactor, pipeline lama melakukan ~365 API calls/cycle dan kena HTTP 429.
+Sekarang ≤21 calls/cycle (1 universe meta + ≤20 candles).
 """
 import time
 from typing import Optional
@@ -21,13 +20,13 @@ from hyperliquid.info import Info
 from config import (
     SPOT, get_api_url,
     MAX_ACCEPTABLE_FUNDING_RATE_HOURLY, NEVER_TRADE_FUNDING_WINDOW_MINUTES,
+    MAX_CANDIDATES_PER_CYCLE, CANDLE_FETCH_INTER_CALL_SLEEP_SEC,
 )
 from strategy.base_strategy import BaseStrategy, TradeSignal
 from strategy.indicators import compute_all_indicators, is_entry_signal
 from strategy.universe import UniverseFetcher
 
 
-# Hyperliquid timeframe → milliseconds (untuk start_ms calc)
 TIMEFRAME_MS = {
     "1m": 60_000, "3m": 180_000, "5m": 300_000, "15m": 900_000,
     "30m": 1_800_000, "1h": 3_600_000, "4h": 14_400_000, "1d": 86_400_000,
@@ -40,60 +39,14 @@ class SpotStrategy(BaseStrategy):
     def __init__(self, info: Info = None, universe: UniverseFetcher = None):
         self._info = info or Info(get_api_url(), skip_ws=True)
         self._universe = universe or UniverseFetcher(self._info)
-        self._candles_cache: dict[str, tuple] = {}          # asset → (df, ts)
-        self._volume_7d_cache: dict[str, tuple] = {}        # asset → (avg, ts)
+        self._candles_cache: dict[str, tuple] = {}        # asset → (df, ts)
 
-    # ------------------------------------------------------------------ filters
-
-    def _passes_7d_volume(self, asset: str) -> bool:
-        """Avg daily volume 7 hari >$100K. Cache 1 jam."""
-        now = time.time()
-        cached = self._volume_7d_cache.get(asset)
-        if cached and (now - cached[1]) < 3600:
-            avg = cached[0]
-        else:
-            end_ms = int(now * 1000)
-            start_ms = end_ms - 8 * 86400 * 1000   # 8 hari buffer
-            try:
-                candles_1d = self._info.candles_snapshot(asset, "1d", start_ms, end_ms)
-            except Exception as e:
-                logger.debug(f"{asset}: 7d volume fetch error: {e}")
-                return False
-            if not candles_1d:
-                return False
-            recent = candles_1d[-7:] if len(candles_1d) >= 7 else candles_1d
-            # candle "v" = volume coin × close (Hyperliquid normalizes to $ notional via field n? no — v is coin)
-            # Hyperliquid candles_snapshot returns 'v' as coin volume + 'n' as trade count.
-            # For $ notional approx: sum(v_i * close_i). Closer approximation:
-            try:
-                avg = sum(float(c["v"]) * float(c["c"]) for c in recent) / len(recent)
-            except (KeyError, ValueError):
-                return False
-            self._volume_7d_cache[asset] = (avg, now)
-        return avg >= SPOT["min_7d_avg_daily_volume_usd"]
-
-    def _passes_drop(self, asset: str) -> tuple[bool, float]:
-        """Daily drop >-2% vs close kemarin."""
-        end_ms = int(time.time() * 1000)
-        start_ms = end_ms - 3 * 86400 * 1000
-        try:
-            candles_1d = self._info.candles_snapshot(asset, "1d", start_ms, end_ms)
-        except Exception as e:
-            logger.debug(f"{asset}: drop fetch error: {e}")
-            return False, 0.0
-        if len(candles_1d) < 2:
-            return False, 0.0
-        prev_close = float(candles_1d[-2]["c"])
-        curr_close = float(candles_1d[-1]["c"])
-        if prev_close <= 0:
-            return False, 0.0
-        drop_pct = (curr_close / prev_close - 1) * 100
-        return drop_pct <= -SPOT["min_daily_drop_pct"], drop_pct
+    # =========================================================== STAGE 1
+    # Ctx-only pre-filter. Tidak ada API call per asset di stage ini.
 
     def _passes_funding(self, ctx: dict) -> bool:
-        """Funding window guard (jangan trade dekat funding payment)."""
         try:
-            funding = float(ctx.get("funding", 0))
+            funding = float(ctx.get("funding", 0) or 0)
             if abs(funding) > MAX_ACCEPTABLE_FUNDING_RATE_HOURLY:
                 return False
             now_utc = time.gmtime()
@@ -105,12 +58,33 @@ class SpotStrategy(BaseStrategy):
         except (KeyError, ValueError, TypeError):
             return True
 
-    # ------------------------------------------------------------------ candles
+    def _passes_7d_volume(self, asset: str, ctx: dict) -> bool:
+        # ctx-only: pakai dayNtlVlm dari meta_and_asset_ctxs (0 API call per aset).
+        try:
+            vol = float(ctx.get("dayNtlVlm", 0) or 0)
+            return vol >= SPOT["min_7d_avg_daily_volume_usd"]
+        except (ValueError, TypeError):
+            return False
+
+    def _ctx_metrics(self, ctx: dict) -> Optional[tuple[float, float, float]]:
+        """Extract (mark_px, day_vol_usd, drop_pct) dari ctx. None jika data tidak valid."""
+        try:
+            mark = float(ctx.get("markPx", 0) or 0)
+            prev = float(ctx.get("prevDayPx", 0) or 0)
+            day_vol = float(ctx.get("dayNtlVlm", 0) or 0)
+        except (TypeError, ValueError):
+            return None
+        if mark <= 0 or prev <= 0:
+            return None
+        drop_pct = (mark / prev - 1) * 100
+        return mark, day_vol, drop_pct
+
+    # =========================================================== STAGE 2
+    # 5m candle fetch (hanya untuk top-N survivors).
 
     def _fetch_5m_candles(self, asset: str) -> Optional[pd.DataFrame]:
         now = time.time()
         cached = self._candles_cache.get(asset)
-        # cache 30s — cycle 60s, jadi hampir selalu fresh
         if cached and (now - cached[1]) < 30:
             return cached[0]
 
@@ -121,7 +95,11 @@ class SpotStrategy(BaseStrategy):
         try:
             candles = self._info.candles_snapshot(asset, tf, start_ms, end_ms)
         except Exception as e:
-            logger.debug(f"{asset}: 5m fetch error: {e}")
+            msg = str(e).lower()
+            if "429" in msg or "rate limit" in msg:
+                logger.warning(f"{asset}: rate-limited on 5m fetch, will retry next cycle")
+            else:
+                logger.debug(f"{asset}: 5m fetch error: {e}")
             return None
         if not candles or len(candles) < 50:
             return None
@@ -134,18 +112,43 @@ class SpotStrategy(BaseStrategy):
         self._candles_cache[asset] = (df, now)
         return df
 
-    # ------------------------------------------------------------------ scan
+    # =========================================================== SCAN
 
     def scan(self) -> list[TradeSignal]:
-        signals = []
+        # ---- Stage 1: ctx-only pre-filter (0 API call per asset) ----
+        candidates: list[tuple[str, dict, float, float, float]] = []
+        # (asset, ctx, mark_px, day_vol, drop_pct)
         for asset, ctx in self._universe.iter_assets():
             if not self._passes_funding(ctx):
                 continue
-            if not self._passes_7d_volume(asset):
+            metrics = self._ctx_metrics(ctx)
+            if metrics is None:
                 continue
-            drop_ok, drop_pct = self._passes_drop(asset)
-            if not drop_ok:
+            mark, day_vol, drop_pct = metrics
+            if not self._passes_7d_volume(asset, ctx):
                 continue
+            if drop_pct > -SPOT["min_daily_drop_pct"]:
+                continue
+            candidates.append((asset, ctx, mark, day_vol, drop_pct))
+
+        if not candidates:
+            logger.debug("Spot scan: 0 candidates after ctx pre-filter")
+            return []
+
+        # Sort: paling drop dulu (kondisi oversold paling kuat)
+        candidates.sort(key=lambda t: t[4])
+        capped = candidates[:MAX_CANDIDATES_PER_CYCLE]
+        logger.info(
+            f"Spot scan: {len(candidates)} ctx-filter survivors, "
+            f"evaluating top {len(capped)} (cap={MAX_CANDIDATES_PER_CYCLE})"
+        )
+
+        # ---- Stage 2: 5m candles + indicators (1 API call per survivor) ----
+        signals: list[TradeSignal] = []
+        for i, (asset, ctx, mark, day_vol, drop_pct) in enumerate(capped):
+            # Throttle untuk smoothing burst (defense in depth)
+            if i > 0 and CANDLE_FETCH_INTER_CALL_SLEEP_SEC > 0:
+                time.sleep(CANDLE_FETCH_INTER_CALL_SLEEP_SEC)
 
             df = self._fetch_5m_candles(asset)
             if df is None:
@@ -164,12 +167,12 @@ class SpotStrategy(BaseStrategy):
             )
             if len(df) < 5:
                 continue
-            latest = df.iloc[-2]   # closed candle
+            latest = df.iloc[-2]
             if not is_entry_signal(latest):
                 continue
 
-            vol_ratio = float(latest["volume"] / df["volume"].iloc[-5:-2].mean()) \
-                if df["volume"].iloc[-5:-2].mean() > 0 else 0.0
+            avg_prev = df["volume"].iloc[-5:-2].mean()
+            vol_ratio = float(latest["volume"] / avg_prev) if avg_prev > 0 else 0.0
             signal = TradeSignal(
                 asset=asset,
                 price=float(latest["close"]),
@@ -181,8 +184,13 @@ class SpotStrategy(BaseStrategy):
                     "macd_hist": float(latest["macd_hist"]),
                     "volume_ratio": vol_ratio,
                     "drop_pct": drop_pct,
+                    "day_ntl_vlm": day_vol,
                     "timeframe": SPOT["timeframe"],
-                    "stoch_params": [SPOT["stoch_rsi_length"], SPOT["stoch_rsi_k_smooth"], SPOT["stoch_rsi_d_smooth"]],
+                    "stoch_params": [
+                        SPOT["stoch_rsi_length"],
+                        SPOT["stoch_rsi_k_smooth"],
+                        SPOT["stoch_rsi_d_smooth"],
+                    ],
                 },
                 strategy_type="spot",
                 leverage=SPOT["leverage"],
@@ -190,7 +198,10 @@ class SpotStrategy(BaseStrategy):
                 sl_mode="pct",
             )
             signals.append(signal)
-            logger.info(f"📊 SPOT SIGNAL: {asset} @ ${signal.price:.4f}")
+            logger.info(
+                f"📊 SPOT SIGNAL: {asset} @ ${signal.price:.4f} "
+                f"(drop={drop_pct:+.2f}%, vol_ratio={vol_ratio:.2f}x)"
+            )
             if len(signals) >= 3:
                 break
         return signals
