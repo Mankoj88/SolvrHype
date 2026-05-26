@@ -148,8 +148,15 @@ class Solvira:
                 *(t for _, t in scan_tasks), return_exceptions=True
             )
             for (label, _), result in zip(scan_tasks, results):
+                if isinstance(result, RuntimeError):
+                    # Expected: API unavailable after retries — skip this cycle, keep loop alive
+                    logger.warning(f"{label} scan cycle skipped (API unavailable): {result}")
+                    continue
                 if isinstance(result, Exception):
-                    logger.warning(f"{label} scan failed: {result}")
+                    logger.exception(
+                        f"{label} scan cycle unexpected error: {result}",
+                        exc_info=result,
+                    )
                     continue
                 all_signals.extend(result)
 

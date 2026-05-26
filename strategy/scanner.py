@@ -32,12 +32,46 @@ class MarketScanner:
         self._daily_candles_cache: dict[str, tuple] = {}  # asset → (data, ts)
 
     def _get_meta_with_ctx(self):
-        """Cache meta dengan TTL 30 detik untuk save API calls."""
+        """Cache meta dengan TTL 30 detik. Retry 3x on 5xx errors."""
         now = time.time()
-        if self._meta_cache is None or now - self._meta_cache_time > 30:
-            self._meta_cache = self.info.meta_and_asset_ctxs()
-            self._meta_cache_time = now
-        return self._meta_cache
+        if self._meta_cache is not None and (now - self._meta_cache_time) <= 30:
+            return self._meta_cache  # cache masih valid, skip API call
+
+        last_exc = None
+        for attempt in range(3):
+            try:
+                self._meta_cache = self.info.meta_and_asset_ctxs()
+                self._meta_cache_time = time.time()
+                return self._meta_cache
+            except Exception as e:
+                last_exc = e
+                err_str = str(e)
+                # 502/504 = server error, worth retrying
+                if any(code in err_str for code in ["502", "503", "504"]):
+                    wait = 5 * (attempt + 1)  # 5s, 10s, 15s
+                    logger.warning(
+                        f"meta_and_asset_ctxs HTTP error (attempt {attempt+1}/3), "
+                        f"retry in {wait}s: {err_str[:120]}"
+                    )
+                    time.sleep(wait)
+                else:
+                    # Non-retryable error (401, 400, dll) — fail immediately
+                    logger.error(f"meta_and_asset_ctxs non-retryable error: {e}")
+                    break
+
+        # Semua retry gagal
+        if self._meta_cache is not None:
+            # Pakai stale cache daripada crash — tambah log warning
+            logger.warning(
+                f"meta_and_asset_ctxs failed after 3 attempts, "
+                f"using stale cache (age {int(now - self._meta_cache_time)}s): {last_exc}"
+            )
+            return self._meta_cache
+
+        # Tidak ada cache sama sekali — raise supaya scan cycle di-skip, bukan crash bot
+        raise RuntimeError(
+            f"meta_and_asset_ctxs unavailable after 3 attempts: {last_exc}"
+        ) from last_exc
 
     def _passes_volume_filter(self, ctx: dict) -> bool:
         try:
