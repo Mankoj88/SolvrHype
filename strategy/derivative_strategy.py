@@ -21,7 +21,10 @@ import pandas as pd
 from loguru import logger
 from hyperliquid.info import Info
 
-from config import DERIVATIVE, get_api_url
+from config import (
+    DERIVATIVE, get_api_url,
+    MAX_CANDIDATES_PER_CYCLE, CANDLE_FETCH_INTER_CALL_SLEEP_SEC,
+)
 from strategy.base_strategy import BaseStrategy, TradeSignal
 from strategy.universe import UniverseFetcher
 from strategy.indicators import detect_volume_spike
@@ -62,7 +65,11 @@ class DerivativeStrategy(BaseStrategy):
         try:
             candles = self._info.candles_snapshot(asset, tf, start_ms, end_ms)
         except Exception as e:
-            logger.debug(f"{asset}: deriv 5m fetch error: {e}")
+            msg = str(e).lower()
+            if "429" in msg or "rate limit" in msg:
+                logger.warning(f"{asset}: rate-limited on deriv 5m fetch, retry next cycle")
+            else:
+                logger.debug(f"{asset}: deriv 5m fetch error: {e}")
             return None
         if not candles or len(candles) < 50:
             return None
@@ -99,16 +106,18 @@ class DerivativeStrategy(BaseStrategy):
         signals: list[TradeSignal] = []
         now_ms = int(time.time() * 1000)
 
+        # ---- Stage 1: ctx-only pre-filter + OI snapshot (0 API call/asset) ----
+        candidates = []   # (asset, ctx, funding, long_setup)
         for asset, ctx in self._universe.iter_assets():
             try:
-                oi = float(ctx.get("openInterest", 0))
+                oi = float(ctx.get("openInterest", 0) or 0)
             except (TypeError, ValueError):
                 oi = 0
             if oi > 0:
                 self.oi_tracker.record(asset, oi, now_ms)
 
             try:
-                funding = float(ctx.get("funding", 0))
+                funding = float(ctx.get("funding", 0) or 0)
             except (TypeError, ValueError):
                 continue
 
@@ -119,6 +128,20 @@ class DerivativeStrategy(BaseStrategy):
 
             if not self.oi_tracker.detect_flush(asset, DERIVATIVE["oi_flush_drop_pct"]):
                 continue
+
+            candidates.append((asset, ctx, funding, long_setup, short_setup))
+
+        if not candidates:
+            return []
+
+        # Cap survivors (defense in depth — biasanya OI flush sudah restrictive)
+        candidates = candidates[:MAX_CANDIDATES_PER_CYCLE]
+        logger.info(f"Deriv scan: {len(candidates)} survivors after OI flush filter")
+
+        # ---- Stage 2: 5m candles untuk survivors ----
+        for i, (asset, ctx, funding, long_setup, short_setup) in enumerate(candidates):
+            if i > 0 and CANDLE_FETCH_INTER_CALL_SLEEP_SEC > 0:
+                time.sleep(CANDLE_FETCH_INTER_CALL_SLEEP_SEC)
 
             df = self._fetch_5m_candles(asset)
             if df is None:

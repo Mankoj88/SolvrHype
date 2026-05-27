@@ -13,7 +13,6 @@ from config import (
     DRY_RUN, USE_TESTNET, LOGS_DIR, MAX_OPEN_POSITIONS, get_api_url,
     HYPERLIQUID_ACCOUNT, INITIAL_CAPITAL_USD,
     MAX_OPEN_POSITIONS_PER_STRATEGY, ENABLE_DERIVATIVE_STRATEGY,
-    AUTO_SWEEP_SPOT_TO_PERP, SPOT_SWEEP_INTERVAL_MINUTES,
 )
 from strategy.spot_strategy import SpotStrategy
 from strategy.universe import UniverseFetcher
@@ -74,23 +73,13 @@ class Solvira:
         for asset, pos in self.order_manager.positions.items():
             self.allocation_manager.reserve(asset, pos.entry_size_usd, pos.strategy_type)
 
-        # Sweep startup: USDC di spot wallet → perp supaya tersedia sebagai margin
-        if AUTO_SWEEP_SPOT_TO_PERP:
-            try:
-                swept = self.wallet.auto_sweep_spot_to_perp()
-                if swept:
-                    logger.info(f"Startup sweep: ${swept:.2f} USDC spot → perp")
-            except Exception as e:
-                logger.warning(f"Startup sweep failed: {e}")
-
     def get_total_capital(self) -> float:
-        """Total tradeable equity = perp accountValue + spot USDC (yang akan di-sweep).
-        Spot tokens TIDAK termasuk karena tidak liquid sebagai margin perp."""
+        """Total tradeable equity dari marginSummary.accountValue.
+        Unified account: spot+perp balance sudah merged, jadi perp_equity
+        adalah sumber tunggal kebenaran (USDC spot sudah include di sini)."""
         try:
             bal = self.wallet.get_unified_balance()
-            # Capital yang RELEVAN untuk sizing trade perp = perp_equity + spot_usdc
-            # (spot_usdc akan otomatis tersapu ke perp via auto_sweep).
-            return bal.perp_equity + bal.spot_usdc
+            return bal.perp_equity
         except Exception as e:
             logger.warning(f"Failed to fetch capital: {e}")
             return 0
@@ -197,8 +186,6 @@ class Solvira:
         schedule.every().day.at("23:59").do(self._daily_summary_job)
         schedule.every().monday.at("09:00").do(self._weekly_review_job)
         schedule.every().day.at("00:05").do(self._daily_snapshot_job)
-        if AUTO_SWEEP_SPOT_TO_PERP:
-            schedule.every(SPOT_SWEEP_INTERVAL_MINUTES).minutes.do(self._wallet_sweep_job)
 
         # Bug #13: schedule runs in its own thread — won't block trading cycle
         schedule_thread = threading.Thread(
@@ -230,7 +217,8 @@ class Solvira:
         try:
             stats = get_daily_stats()
             bal = self.wallet.get_unified_balance(force_refresh=True)
-            stats["capital"] = bal.perp_equity + bal.spot_usdc
+            # Unified account: perp_equity = total equity (spot+perp merged)
+            stats["capital"] = bal.perp_equity
             stats["balance"] = bal.to_dict()
             stats["pending_withdraw"] = self.withdraw_manager.state.get(
                 "cumulative_profit_pending", 0
@@ -239,14 +227,6 @@ class Solvira:
         except Exception as e:
             logger.exception(f"Daily summary failed: {e}")
 
-    def _wallet_sweep_job(self):
-        try:
-            swept = self.wallet.auto_sweep_spot_to_perp()
-            if swept:
-                logger.info(f"Scheduled sweep: ${swept:.2f} USDC spot → perp")
-        except Exception as e:
-            logger.exception(f"Wallet sweep job failed: {e}")
-    
     def _weekly_review_job(self):
         try:
             run_weekly_review()
