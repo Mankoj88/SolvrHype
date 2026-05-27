@@ -23,7 +23,7 @@ USE_TESTNET = os.getenv("USE_TESTNET", "true").lower() == "true"
 DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
 
 # === MARKET FILTERS (per spesifikasi user) ===
-MIN_DAILY_VOLUME_USD = 5_000_000   # >$5M/hari di Hyperliquid
+MIN_DAILY_VOLUME_USD = 100_000   # >$5M/hari di Hyperliquid
 MIN_DAILY_DROP_PCT = 10.0           # >10% penurunan vs hari sebelumnya
 # Market cap filter DIABAIKAN per spesifikasi user
 
@@ -181,3 +181,8 @@ def get_api_url() -> str:
 
 # === INITIAL CAPITAL (untuk stop-loss enforcer) ===
 INITIAL_CAPITAL_USD = 500
+# Rate limit fix — max candidates per scan cycle
+MAX_CANDIDATES_PER_CYCLE = int(os.getenv('MAX_CANDIDATES_PER_CYCLE', '20'))
+
+# Candle fetch inter-call sleep
+CANDLE_FETCH_INTER_CALL_SLEEP_SEC = float(os.getenv('CANDLE_FETCH_SLEEP', '0.1'))
