@@ -116,23 +116,36 @@ class SpotStrategy(BaseStrategy):
 
     def scan(self) -> list[TradeSignal]:
         # ---- Stage 1: ctx-only pre-filter (0 API call per asset) ----
+        # Counters only (no per-asset logging in hot path — avoid spam on 100+ assets)
+        n_funding_fail = 0
+        n_ctx_invalid = 0
+        n_vol_fail = 0
+        n_drop_fail = 0
         candidates: list[tuple[str, dict, float, float, float]] = []
         # (asset, ctx, mark_px, day_vol, drop_pct)
         for asset, ctx in self._universe.iter_assets():
             if not self._passes_funding(ctx):
+                n_funding_fail += 1
                 continue
             metrics = self._ctx_metrics(ctx)
             if metrics is None:
+                n_ctx_invalid += 1
                 continue
             mark, day_vol, drop_pct = metrics
             if not self._passes_7d_volume(asset, ctx):
+                n_vol_fail += 1
                 continue
             if drop_pct > -SPOT["min_daily_drop_pct"]:
+                n_drop_fail += 1
                 continue
             candidates.append((asset, ctx, mark, day_vol, drop_pct))
 
         if not candidates:
-            logger.debug("Spot scan: 0 candidates after ctx pre-filter")
+            logger.info(
+                f"Spot scan: 0 candidates after ctx pre-filter "
+                f"(funding={n_funding_fail}, ctx_invalid={n_ctx_invalid}, "
+                f"volume={n_vol_fail}, drop={n_drop_fail})"
+            )
             return []
 
         # Sort: paling drop dulu (kondisi oversold paling kuat)
@@ -144,6 +157,12 @@ class SpotStrategy(BaseStrategy):
         )
 
         # ---- Stage 2: 5m candles + indicators (1 API call per survivor) ----
+        # Per-asset debug logging is OK here (≤ MAX_CANDIDATES_PER_CYCLE iterations).
+        n_candle_fail = 0
+        n_insufficient_data = 0
+        n_stoch_fail = 0
+        n_macd_fail = 0
+        n_vol_spike_fail = 0
         signals: list[TradeSignal] = []
         for i, (asset, ctx, mark, day_vol, drop_pct) in enumerate(capped):
             # Throttle untuk smoothing burst (defense in depth)
@@ -152,6 +171,10 @@ class SpotStrategy(BaseStrategy):
 
             df = self._fetch_5m_candles(asset)
             if df is None:
+                n_candle_fail += 1
+                logger.debug(
+                    f"{asset} | drop={drop_pct:+.2f}% | verdict=FAIL candle_fetch"
+                )
                 continue
             df = compute_all_indicators(
                 df,
@@ -166,10 +189,43 @@ class SpotStrategy(BaseStrategy):
                 vol_multiplier=SPOT["vol_spike_multiplier"],
             )
             if len(df) < 5:
+                n_insufficient_data += 1
+                logger.debug(
+                    f"{asset} | drop={drop_pct:+.2f}% | verdict=FAIL insufficient_data"
+                )
                 continue
             latest = df.iloc[-2]
+
+            stoch_k = float(latest["stoch_rsi_k"]) if pd.notna(latest["stoch_rsi_k"]) else float("nan")
+            stoch_d = float(latest["stoch_rsi_d"]) if pd.notna(latest["stoch_rsi_d"]) else float("nan")
+            macd_hist = float(latest["macd_hist"]) if pd.notna(latest["macd_hist"]) else float("nan")
+            vol_val = float(latest["volume"])
+            stoch_pass = bool(latest["stoch_golden_cross"])
+            macd_pass = bool(latest["macd_reversal"])
+            vol_spike_pass = bool(latest["volume_spike"])
+
             if not is_entry_signal(latest):
+                if not stoch_pass:
+                    fail_reason = "stoch_xover"
+                    n_stoch_fail += 1
+                elif not macd_pass:
+                    fail_reason = "macd_reversal"
+                    n_macd_fail += 1
+                else:
+                    fail_reason = "volume_spike"
+                    n_vol_spike_fail += 1
+                logger.debug(
+                    f"{asset} | drop={drop_pct:+.2f}% | vol={vol_val:.0f} | "
+                    f"stoch_k={stoch_k:.1f} | stoch_d={stoch_d:.1f} | "
+                    f"macd_hist={macd_hist:+.4f} | verdict=FAIL {fail_reason}"
+                )
                 continue
+
+            logger.debug(
+                f"{asset} | drop={drop_pct:+.2f}% | vol={vol_val:.0f} | "
+                f"stoch_k={stoch_k:.1f} | stoch_d={stoch_d:.1f} | "
+                f"macd_hist={macd_hist:+.4f} | verdict=PASS"
+            )
 
             avg_prev = df["volume"].iloc[-5:-2].mean()
             vol_ratio = float(latest["volume"] / avg_prev) if avg_prev > 0 else 0.0
@@ -199,9 +255,36 @@ class SpotStrategy(BaseStrategy):
             )
             signals.append(signal)
             logger.info(
-                f"📊 SPOT SIGNAL: {asset} @ ${signal.price:.4f} "
-                f"(drop={drop_pct:+.2f}%, vol_ratio={vol_ratio:.2f}x)"
+                f"SIGNAL: {asset} | entry=${signal.price:.4f} | "
+                f"stoch_k={stoch_k:.1f} | drop={drop_pct:+.2f}% | vol_ratio={vol_ratio:.2f}x"
             )
             if len(signals) >= 3:
                 break
+
+        # End-of-scan summary
+        logger.info(
+            f"Scan complete: {len(capped)} evaluated, {len(signals)} signals | "
+            f"stage2_filters: stoch={n_stoch_fail}, macd={n_macd_fail}, "
+            f"vol_spike={n_vol_spike_fail}, candle_fail={n_candle_fail}, "
+            f"insufficient_data={n_insufficient_data} | "
+            f"stage1_filters: drop={n_drop_fail}, volume={n_vol_fail}, "
+            f"funding={n_funding_fail}, ctx_invalid={n_ctx_invalid}"
+        )
+
+        if not signals:
+            rejections = {
+                "stoch_xover": n_stoch_fail,
+                "macd_reversal": n_macd_fail,
+                "volume_spike": n_vol_spike_fail,
+                "candle_fetch": n_candle_fail,
+                "insufficient_data": n_insufficient_data,
+            }
+            top_name, top_count = max(rejections.items(), key=lambda x: x[1])
+            if top_count == 0:
+                logger.info("No signals this cycle. No stage2 rejections recorded.")
+            else:
+                logger.info(
+                    f"No signals this cycle. Top rejection reason: "
+                    f"{top_name} ({top_count}/{len(capped)})"
+                )
         return signals
