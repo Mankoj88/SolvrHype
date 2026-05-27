@@ -66,6 +66,20 @@ class WalletReader:
         self._exchange = exchange
         self._account = account or HYPERLIQUID_ACCOUNT
         self._cache: Optional[WalletBalance] = None
+        # usdClassTransfer is an EIP-712 user-signed action: Hyperliquid resolves
+        # the user from signature recovery, ignoring Exchange.account_address.
+        # If the Exchange signer is an API wallet (≠ main account), the transfer
+        # will fail with "Must deposit before performing actions" — so we must
+        # detect this and skip sweep entirely.
+        self._is_api_wallet = False
+        if exchange is not None and self._account:
+            try:
+                signer = getattr(exchange, "wallet", None)
+                signer_addr = getattr(signer, "address", None)
+                if signer_addr and signer_addr.lower() != self._account.lower():
+                    self._is_api_wallet = True
+            except Exception as e:
+                logger.debug(f"Wallet: signer address check failed: {e}")
 
     # ---------------------------------------------------------------- read
 
@@ -166,6 +180,16 @@ class WalletReader:
         Return amount yang di-sweep (float), atau None kalau skip/gagal.
         """
         if not AUTO_SWEEP_SPOT_TO_PERP:
+            return None
+        if self._is_api_wallet:
+            bal = self.get_unified_balance(force_refresh=True)
+            if bal.spot_usdc >= (min_amount if min_amount is not None else MIN_SPOT_SWEEP_USD):
+                logger.warning(
+                    f"Wallet sweep SKIPPED: API-wallet mode detected "
+                    f"(signer != HYPERLIQUID_ACCOUNT). usdClassTransfer requires "
+                    f"main wallet's private key. ${bal.spot_usdc:.2f} USDC stuck in "
+                    f"spot — please transfer Spot→Perp manually in the Hyperliquid UI."
+                )
             return None
         threshold = min_amount if min_amount is not None else MIN_SPOT_SWEEP_USD
 
