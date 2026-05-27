@@ -1,14 +1,19 @@
 """
 WalletReader — unified view balance Hyperliquid (Unified Account mode).
 
-Akun dalam mode Unified Account: spot+perp balance SUDAH MERGED — USDC adalah
-satu balance yang cover spot + perps sekaligus, dan marginSummary.accountValue
-sudah include semua USDC. usdClassTransfer (Spot→Perp) tidak diperlukan dan
-tidak berlaku, jadi kita tidak fetch spot_user_state untuk add ke total.
+Akun Unified Account: spot USDC dipakai otomatis sebagai margin untuk perp.
+marginSummary.accountValue HANYA mencerminkan collateral yang sedang terpakai
+(= 0 ketika tidak ada open position), sehingga TIDAK bisa dipakai sebagai
+sumber tunggal kebenaran untuk total tradeable capital.
+
+Total equity yang benar di unified mode =
+    perp_equity (collateral aktif di marginSummary)
+  + spot USDC (margin yang masih bebas)
 
 Fungsi modul ini:
-1. get_unified_balance() — return perp_equity = total_equity dari
-   marginSummary.accountValue (sumber tunggal kebenaran di unified mode).
+1. get_unified_balance() — gabung perp accountValue + spot USDC jadi
+   total_equity, lalu propagate ke field perp_equity supaya konsumen
+   (get_total_capital di main.py) tetap dapat angka yang benar.
 2. auto_sweep_spot_to_perp() — no-op di unified mode (silent return).
 
 Cache 30s untuk hindari hammer API tiap heartbeat.
@@ -73,18 +78,37 @@ class WalletReader:
 
         bal = WalletBalance(fetched_at=now)
 
-        # Unified account: spot+perp balance sudah merged. marginSummary.accountValue
-        # adalah sumber tunggal kebenaran untuk total equity — TIDAK fetch
-        # spot_user_state untuk add ke total (USDC spot sudah include di sini).
+        # Unified account: accountValue = collateral aktif (0 kalau tidak ada
+        # posisi). Spot USDC dipakai otomatis sebagai margin, jadi harus
+        # ditambahkan untuk dapat total tradeable equity yang sebenarnya.
+        perp_equity_raw = 0.0
         try:
             perp_state = self._info.user_state(self._account)
             ms = perp_state.get("marginSummary", {}) if perp_state else {}
-            bal.perp_equity = float(ms.get("accountValue", 0) or 0)
+            perp_equity_raw = float(ms.get("accountValue", 0) or 0)
             bal.perp_withdrawable = float(perp_state.get("withdrawable", 0) or 0)
         except Exception as e:
             logger.warning(f"Wallet: perp user_state fetch failed: {e}")
 
-        bal.total_equity = bal.perp_equity
+        spot_usdc = 0.0
+        try:
+            spot_state = self._info.spot_user_state(self._account)
+            for b in (spot_state or {}).get("balances", []) or []:
+                if b.get("coin") == "USDC":
+                    spot_usdc += float(b.get("total", 0) or 0)
+        except Exception as e:
+            logger.warning(f"Wallet: spot_user_state fetch failed: {e}")
+
+        bal.spot_usdc = spot_usdc
+        bal.total_equity = perp_equity_raw + spot_usdc
+        # Propagate ke perp_equity supaya get_total_capital() di main.py
+        # (yang baca bal.perp_equity) dapat total equity unified, bukan 0.
+        bal.perp_equity = bal.total_equity
+
+        logger.info(
+            f"Balance: perp={perp_equity_raw:.2f}, spot_usdc={spot_usdc:.2f}, "
+            f"total={bal.total_equity:.2f}"
+        )
 
         self._cache = bal
         return bal
