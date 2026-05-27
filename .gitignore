@@ -11,6 +11,14 @@ __pycache__/
 *.pyc
 .pytest_cache/
 
+# Test/Coverage cache
+.coverage
+htmlcov/
+.benchmarks/
+.hypothesis/
+.pytest_run.log
+stress_st*.txt
+
 # Database
 data/
 *.db
