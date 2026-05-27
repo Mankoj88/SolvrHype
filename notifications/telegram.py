@@ -79,10 +79,10 @@ def notify_shutdown(reason: str = "normal"):
 def notify_daily_summary(stats: dict):
     pnl_emoji = "📈" if stats["pnl_usd"] >= 0 else "📉"
     bal = stats.get("balance") or {}
-    perp_eq = float(bal.get("perp_equity", stats.get("capital", 0)))
-    spot_usdc = float(bal.get("spot_usdc", 0))
-    spot_tokens_value = float(bal.get("spot_tokens_value_usd", 0))
-    total_equity = float(bal.get("total_equity", perp_eq + spot_usdc + spot_tokens_value))
+    # Unified account: marginSummary.accountValue = total tradeable equity
+    # (spot+perp USDC merged). Fallback ke stats["capital"] kalau balance
+    # dict tidak ada (mis. di test path).
+    unified_equity = float(bal.get("perp_equity", stats.get("capital", 0)))
     pending_withdraw = float(
         stats.get("pending_withdraw", stats.get("usdt_wallet", 0))
     )
@@ -94,29 +94,7 @@ def notify_daily_summary(stats: dict):
         f"Wins/Losses: {stats['wins']}/{stats['losses']}\n"
         f"Win Rate: {stats['win_rate']:.1%}\n"
         f"{pnl_emoji} PnL: ${stats['pnl_usd']:+.2f} ({stats['pnl_pct']:+.2f}%)\n\n"
-        f"💼 <b>Unified Wallet</b>\n"
-        f"• Perp equity: ${perp_eq:.2f}\n"
-        f"• Spot USDC: ${spot_usdc:.2f}\n"
-    )
-
-    spot_tokens = bal.get("spot_tokens") or {}
-    if spot_tokens:
-        msg += f"• Spot tokens (${spot_tokens_value:.2f}):\n"
-        # Tampilkan max 5 token teratas by value
-        sorted_tokens = sorted(
-            spot_tokens.items(),
-            key=lambda kv: float(kv[1].get("value_usd", 0)),
-            reverse=True,
-        )[:5]
-        for coin, t in sorted_tokens:
-            value = float(t.get("value_usd", 0))
-            amount = float(t.get("total", 0))
-            if value < 0.01 and amount < 1e-6:
-                continue
-            msg += (f"  · {_esc(coin)}: {amount:.4f} (${value:.2f})\n")
-
-    msg += (
-        f"💰 <b>Total equity: ${total_equity:.2f}</b>\n"
+        f"💰 <b>Unified equity: ${unified_equity:.2f}</b>\n"
         f"💵 Pending withdraw: ${pending_withdraw:.2f}\n"
     )
 
