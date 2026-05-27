@@ -150,12 +150,12 @@ COOLDOWN_AFTER_CLOSE_MINUTES = 60  # cooldown per asset setelah posisi close
 HL_BRIDGE_FEE_USD = 1.0  # Hyperliquid bridge withdrawal fee (flat $1)
 
 # === UNIFIED WALLET (perp + spot) ===
-# Bot trading hanya di PERP (spot strategy = perp 1x, deriv = perp ≤5x).
-# Karena itu USDC di spot wallet harus di-sweep ke perp supaya bisa dipakai
-# sebagai margin. Hyperliquid Spot ↔ Perp transfer internal gratis.
-AUTO_SWEEP_SPOT_TO_PERP = os.getenv("AUTO_SWEEP_SPOT_TO_PERP", "true").lower() == "true"
-MIN_SPOT_SWEEP_USD = float(os.getenv("MIN_SPOT_SWEEP_USD", "1.0"))
-SPOT_SWEEP_INTERVAL_MINUTES = int(os.getenv("SPOT_SWEEP_INTERVAL_MINUTES", "15"))
+# Akun Hyperliquid dalam mode Unified Account: spot+perp balance sudah merged.
+# USDC adalah SATU balance yang cover spot + perps sekaligus, dan
+# marginSummary.accountValue sudah include semua USDC. usdClassTransfer
+# (Spot→Perp) tidak diperlukan dan tidak berlaku di mode ini.
+# Hardcoded False: unified account mode, no spot/perp separation.
+AUTO_SWEEP_SPOT_TO_PERP = False
 
 # === WITHDRAWAL ===
 WITHDRAW_PROFIT_PCT = 0.50             # 50% profit ke USDT-Arbitrum
