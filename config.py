@@ -54,7 +54,18 @@ SLIPPAGE_TOLERANCE = 0.005
 STRATEGY_POOL_SPLIT = {"spot": 0.50, "derivative": 0.50}
 MAX_OPEN_POSITIONS_PER_STRATEGY = {"spot": 3, "derivative": 2}
 ENABLE_DERIVATIVE_STRATEGY = os.getenv("ENABLE_DERIVATIVE", "false").lower() == "true"
-UNIVERSE_REFRESH_INTERVAL_SECONDS = 3600
+# Universe ctx (dayNtlVlm, prevDayPx, funding) berubah terus, harus fresh tiap
+# cycle. Cycle = 60s, jadi cache 60s = 1 API call/menit untuk universe.
+UNIVERSE_REFRESH_INTERVAL_SECONDS = 60
+
+# Hard cap survivor count yang di-fetch 5m candles per cycle. Mencegah
+# burst calls saat banyak aset lolos ctx pre-filter. 20 × 1 call/asset
+# = 20 calls/min, jauh di bawah HL rate limit (~60/min).
+MAX_CANDIDATES_PER_CYCLE = int(os.getenv("MAX_CANDIDATES_PER_CYCLE", "20"))
+
+# Inter-call sleep saat fetch batch 5m candles. 100ms × 20 = 2s total — kecil
+# tapi cukup untuk smoothing burst supaya tidak trip per-second sub-limit.
+CANDLE_FETCH_INTER_CALL_SLEEP_SEC = float(os.getenv("CANDLE_FETCH_SLEEP", "0.1"))
 
 SPOT = {
     "timeframe": "5m",
