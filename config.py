@@ -24,16 +24,16 @@ DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
 
 # === MARKET FILTERS (per spesifikasi user) ===
 MIN_DAILY_VOLUME_USD = 100_000   # >$5M/hari di Hyperliquid
-MIN_DAILY_DROP_PCT = 10.0           # >10% penurunan vs hari sebelumnya
+MIN_DAILY_DROP_PCT = 2.0            # >2% penurunan vs hari sebelumnya
 # Market cap filter DIABAIKAN per spesifikasi user
 
 # === INDICATORS ===
 TIMEFRAME = "10m"
 CANDLE_LOOKBACK = 100
 STOCH_RSI_OVERSOLD = 20
-STOCH_RSI_LENGTH = 14
-STOCH_RSI_K_SMOOTH = 3
-STOCH_RSI_D_SMOOTH = 3
+STOCH_RSI_LENGTH = 10
+STOCH_RSI_K_SMOOTH = 5
+STOCH_RSI_D_SMOOTH = 5
 MACD_FAST = 12
 MACD_SLOW = 26
 MACD_SIGNAL = 9
