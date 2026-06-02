@@ -59,7 +59,8 @@ class Solvira:
             except ImportError as e:
                 logger.warning(f"Derivative strategy not available yet: {e}")
         self.order_manager = OrderManager()
-        self.allocation_manager = AllocationManager()
+        # Pass info so spot sizing can resolve the exchange-min order notional.
+        self.allocation_manager = AllocationManager(self.info)
         self.withdraw_manager = WithdrawManager()
         self.wallet = WalletReader(
             info=self.info, exchange=self.order_manager.exchange,

@@ -33,3 +33,7 @@ logs/
 Thumbs.db
 .vscode/
 .idea/
+.venv/
+.claude/
+.coverage
+.rtk/

@@ -7,6 +7,8 @@ Boundary tests around 90-day window and -$200 EVALUATION_LOSS_THRESHOLD_USD.
 
 import pytest
 
+from config import EVALUATION_LOSS_THRESHOLD_USD as THRESHOLD
+
 pytestmark = [pytest.mark.unit, pytest.mark.blocker]
 
 
@@ -59,7 +61,8 @@ class TestUnder90DaysNoHalt:
 
 
 # -----------------------------------------------------------------------------
-# SL3 — 90 days, -$199 → no halt (loss below threshold)
+# SL3 — 90 days, just below threshold → no halt (loss below threshold)
+# Threshold-relative so it stays correct after the live rescale.
 # -----------------------------------------------------------------------------
 class TestBoundary199NoHalt:
     def test_minus_199_no_halt(self, enforcer_env, freeze_clock, monkeypatch):
@@ -68,7 +71,7 @@ class TestBoundary199NoHalt:
         sle = sle_mod.StopLossEnforcer(initial_capital=500.0)
 
         freeze_clock.move_to("2026-04-02 00:00:00")  # 91 days later
-        _set_pnl(monkeypatch, sle_mod, -199.0)
+        _set_pnl(monkeypatch, sle_mod, -(THRESHOLD - 1.0))
 
         ok, _ = sle.check()
         assert ok is True
@@ -76,7 +79,7 @@ class TestBoundary199NoHalt:
 
 
 # -----------------------------------------------------------------------------
-# SL4 — 90 days, exactly -$200 → halt (threshold inclusive)
+# SL4 — 90 days, exactly at threshold → halt (threshold inclusive)
 # -----------------------------------------------------------------------------
 class TestExactThresholdHalt:
     def test_minus_200_halts(self, enforcer_env, freeze_clock, monkeypatch):
@@ -85,7 +88,7 @@ class TestExactThresholdHalt:
         sle = sle_mod.StopLossEnforcer(initial_capital=500.0)
 
         freeze_clock.move_to("2026-04-02 00:00:00")
-        _set_pnl(monkeypatch, sle_mod, -200.0)
+        _set_pnl(monkeypatch, sle_mod, -float(THRESHOLD))
 
         ok, reason = sle.check()
         assert ok is False
@@ -94,7 +97,7 @@ class TestExactThresholdHalt:
 
 
 # -----------------------------------------------------------------------------
-# SL5 — 90 days, -$201 → halt (over threshold)
+# SL5 — 90 days, just over threshold → halt (over threshold)
 # -----------------------------------------------------------------------------
 class TestOverThresholdHalt:
     def test_minus_201_halts(self, enforcer_env, freeze_clock, monkeypatch):
@@ -103,7 +106,7 @@ class TestOverThresholdHalt:
         sle = sle_mod.StopLossEnforcer(initial_capital=500.0)
 
         freeze_clock.move_to("2026-04-02 00:00:00")
-        _set_pnl(monkeypatch, sle_mod, -201.0)
+        _set_pnl(monkeypatch, sle_mod, -(THRESHOLD + 1.0))
 
         ok, _ = sle.check()
         assert ok is False

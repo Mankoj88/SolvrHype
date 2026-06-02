@@ -27,6 +27,10 @@ MIN_DAILY_VOLUME_USD = 100_000   # >$5M/hari di Hyperliquid
 MIN_DAILY_DROP_PCT = 2.0            # >2% penurunan vs hari sebelumnya
 # Market cap filter DIABAIKAN per spesifikasi user
 
+# Spot universe/scan volume gate per spec: "24h volume > $500,000".
+# Replaces the old 7d-avg 100k proxy for SPOT scanning (derivative path unchanged).
+SCAN_MIN_24H_VOLUME_USD = 500_000
+
 # === INDICATORS ===
 TIMEFRAME = "10m"
 CANDLE_LOOKBACK = 100
@@ -34,11 +38,21 @@ STOCH_RSI_OVERSOLD = 20
 STOCH_RSI_LENGTH = 10
 STOCH_RSI_K_SMOOTH = 5
 STOCH_RSI_D_SMOOTH = 5
-MACD_FAST = 12
-MACD_SLOW = 26
-MACD_SIGNAL = 9
-VOLUME_SPIKE_LOOKBACK = 3           # 3 candle sebelumnya
+# MACD tuned for spot per spec: fast=10, slow=30, signal=10 (was 12/26/9).
+MACD_FAST = 10
+MACD_SLOW = 30
+MACD_SIGNAL = 10
+VOLUME_SPIKE_LOOKBACK = 3           # 3 candle sebelumnya (legacy/deriv path)
 VOLUME_SPIKE_MULTIPLIER = 1.5
+
+# === SPOT WINDOWED-CONFIRMATION PARAMS (closed candles only) ===
+# Conditions 2-4 confirm over a short window of recent CLOSED candles instead
+# of demanding all three line up on the single entry candle (the old 0-trades
+# bug). All windows count back from the latest closed candle (iloc[-2]).
+STOCH_CROSS_LOOKBACK = 3      # golden cross may occur within last N closed candles
+MACD_HIST_RISING_BARS = 1     # histogram must be rising for at least this many bars
+VOLUME_SMA_PERIOD = 20        # baseline SMA period for volume
+VOLUME_SPIKE_WINDOW = 48      # spike must have occurred within last N closed candles (30-60)
 
 # === EXECUTION (DEPRECATED — kept for backward compat during phase 1-3 rollout) ===
 TAKE_PROFITS = [
@@ -69,17 +83,26 @@ CANDLE_FETCH_INTER_CALL_SLEEP_SEC = float(os.getenv("CANDLE_FETCH_SLEEP", "0.1")
 
 SPOT = {
     "timeframe": "5m",
+    # Lookback must cover the widest window + indicator warmup so the windowed
+    # checks always see valid data: max(VOLUME_SPIKE_WINDOW=48, 60)=60 + ~MACD
+    # (30+10) / stoch (10+5+5) warmup ~= 100 bars. 120 closed 5m bars (~10h)
+    # clears that with ~20 bars margin.
     "candle_lookback": 120,
-    "min_7d_avg_daily_volume_usd": 100_000,
+    "min_7d_avg_daily_volume_usd": 100_000,   # legacy key (deriv/other paths)
+    "scan_min_24h_volume_usd": SCAN_MIN_24H_VOLUME_USD,  # spot gate per spec
     "min_daily_drop_pct": 2.0,            # -2% vs close kemarin
     "max_entry_slippage_pct": 0.3,
     "stoch_rsi_length": 10,
     "stoch_rsi_k_smooth": 5,
     "stoch_rsi_d_smooth": 5,
     "stoch_rsi_oversold": 20,
-    "macd_fast": 12, "macd_slow": 26, "macd_signal": 9,
-    "vol_spike_lookback": 3,
+    "stoch_cross_lookback": STOCH_CROSS_LOOKBACK,
+    "macd_fast": 10, "macd_slow": 30, "macd_signal": 10,
+    "macd_hist_rising_bars": MACD_HIST_RISING_BARS,
+    "vol_spike_lookback": 3,              # legacy key (unused by spot windowed path)
     "vol_spike_multiplier": 1.5,
+    "volume_sma_period": VOLUME_SMA_PERIOD,
+    "volume_spike_window": VOLUME_SPIKE_WINDOW,
     "cutloss_pct": -2.0,
     # (tp_pct, sell_fraction_of_remaining, post_action)
     "take_profits": [(5.0, 0.50, "breakeven"), (10.0, 0.50, None), (20.0, 1.00, None)],
@@ -109,18 +132,36 @@ DERIVATIVE = {
 }
 
 # === RISK MANAGEMENT [HARD LIMITS — DO NOT MODIFY] ===
+# Left at 500: on a ~$40 account this ceiling never binds (spot pool ~$20 and
+# derivative margin are already capped well below it by pool capacity), so
+# lowering it adds no protection.
 MAX_POSITION_SIZE_USD = 500
 MAX_OPEN_POSITIONS = 3
-MIN_POSITION_SIZE_USD = 50
+# Lowered 50 -> 10 (operator decision) so small pools can trade down to the
+# Hyperliquid exchange minimum. Governs both spot & derivative entry gates.
+MIN_POSITION_SIZE_USD = 10
 LEVERAGE = 1
+
+# === SPOT POSITION FLOOR (exchange-minimum aware) ===
+# Hyperliquid enforces a flat platform-wide minimum ORDER VALUE; its spot meta
+# (verified via /info spotMeta: 301 pairs / 464 tokens) exposes NO per-asset
+# min-notional field — only szDecimals (lot granularity). So the runtime
+# "exchange min" lookup resolves to this documented platform minimum, and spot
+# sizing uses max(exchange_min_notional, SPOT_MIN_POSITION_FLOOR).
+SPOT_MIN_POSITION_FLOOR = 10
+HL_PLATFORM_MIN_ORDER_USD = 10
 USE_ISOLATED_MARGIN = True
 MAX_CONSECUTIVE_LOSSES = 7
 MAX_DAILY_LOSS_PCT = 10.0
-MAX_DAILY_LOSS_USD = 50
+# Rescaled for ~$40 account (operator, 2026-06-02): ~10% of balance, so the USD
+# branch aligns with the 10% pct branch instead of being dead weight.
+MAX_DAILY_LOSS_USD = 4
 
 # === STOP-LOSS RULE (3 bulan komitmen) ===
 EVALUATION_PERIOD_DAYS = 90
-EVALUATION_LOSS_THRESHOLD_USD = 200
+# Rescaled 200 -> 20 (operator, 2026-06-02): ~50% of a ~$40 account, so the
+# 3-month halt can actually fire before the account is depleted.
+EVALUATION_LOSS_THRESHOLD_USD = 20
 
 # === ALLOCATION ===
 def get_allocation(capital: float) -> list[float]:
@@ -180,7 +221,9 @@ def get_api_url() -> str:
     return "https://api.hyperliquid.xyz"
 
 # === INITIAL CAPITAL (untuk stop-loss enforcer) ===
-INITIAL_CAPITAL_USD = 500
+# Rescaled 500 -> 40 (operator, 2026-06-02) to match the real live balance
+# (~$39.94) so the enforcer's baseline / pct accounting is correct.
+INITIAL_CAPITAL_USD = 40
 # Rate limit fix — max candidates per scan cycle
 MAX_CANDIDATES_PER_CYCLE = int(os.getenv('MAX_CANDIDATES_PER_CYCLE', '20'))
 

@@ -18,12 +18,12 @@ from loguru import logger
 from hyperliquid.info import Info
 
 from config import (
-    SPOT, get_api_url,
+    SPOT, get_api_url, SCAN_MIN_24H_VOLUME_USD,
     MAX_ACCEPTABLE_FUNDING_RATE_HOURLY, NEVER_TRADE_FUNDING_WINDOW_MINUTES,
     MAX_CANDIDATES_PER_CYCLE, CANDLE_FETCH_INTER_CALL_SLEEP_SEC,
 )
 from strategy.base_strategy import BaseStrategy, TradeSignal
-from strategy.indicators import compute_all_indicators, is_entry_signal
+from strategy.indicators import compute_spot_indicators, evaluate_spot_conditions
 from strategy.universe import UniverseFetcher
 
 
@@ -58,11 +58,12 @@ class SpotStrategy(BaseStrategy):
         except (KeyError, ValueError, TypeError):
             return True
 
-    def _passes_7d_volume(self, asset: str, ctx: dict) -> bool:
-        # ctx-only: pakai dayNtlVlm dari meta_and_asset_ctxs (0 API call per aset).
+    def _passes_volume(self, asset: str, ctx: dict) -> bool:
+        # Spec gate: "24h volume > $500,000". dayNtlVlm is the 24h notional
+        # volume from meta_and_asset_ctxs (0 API call per asset).
         try:
             vol = float(ctx.get("dayNtlVlm", 0) or 0)
-            return vol >= SPOT["min_7d_avg_daily_volume_usd"]
+            return vol >= SCAN_MIN_24H_VOLUME_USD
         except (ValueError, TypeError):
             return False
 
@@ -132,7 +133,7 @@ class SpotStrategy(BaseStrategy):
                 n_ctx_invalid += 1
                 continue
             mark, day_vol, drop_pct = metrics
-            if not self._passes_7d_volume(asset, ctx):
+            if not self._passes_volume(asset, ctx):
                 n_vol_fail += 1
                 continue
             if drop_pct > -SPOT["min_daily_drop_pct"]:
@@ -176,7 +177,7 @@ class SpotStrategy(BaseStrategy):
                     f"{asset} | drop={drop_pct:+.2f}% | verdict=FAIL candle_fetch"
                 )
                 continue
-            df = compute_all_indicators(
+            df = compute_spot_indicators(
                 df,
                 stoch_length=SPOT["stoch_rsi_length"],
                 stoch_k=SPOT["stoch_rsi_k_smooth"],
@@ -185,46 +186,49 @@ class SpotStrategy(BaseStrategy):
                 macd_fast=SPOT["macd_fast"],
                 macd_slow=SPOT["macd_slow"],
                 macd_signal=SPOT["macd_signal"],
-                vol_lookback=SPOT["vol_spike_lookback"],
-                vol_multiplier=SPOT["vol_spike_multiplier"],
+                volume_sma_period=SPOT["volume_sma_period"],
+                volume_spike_multiplier=SPOT["vol_spike_multiplier"],
             )
-            if len(df) < 5:
+            # Need enough closed candles for the widest window (volume_spike_window).
+            if len(df) < SPOT["volume_spike_window"] + 2:
                 n_insufficient_data += 1
                 logger.debug(
-                    f"{asset} | drop={drop_pct:+.2f}% | verdict=FAIL insufficient_data"
+                    f"{asset} | drop={drop_pct:+.2f}% | verdict=FAIL insufficient_data "
+                    f"(bars={len(df)} < {SPOT['volume_spike_window'] + 2})"
                 )
                 continue
-            latest = df.iloc[-2]
+            latest = df.iloc[-2]   # latest CLOSED candle (never iloc[-1])
 
             stoch_k = float(latest["stoch_rsi_k"]) if pd.notna(latest["stoch_rsi_k"]) else float("nan")
             stoch_d = float(latest["stoch_rsi_d"]) if pd.notna(latest["stoch_rsi_d"]) else float("nan")
             macd_hist = float(latest["macd_hist"]) if pd.notna(latest["macd_hist"]) else float("nan")
             vol_val = float(latest["volume"])
-            stoch_pass = bool(latest["stoch_golden_cross"])
-            macd_pass = bool(latest["macd_reversal"])
-            vol_spike_pass = bool(latest["volume_spike"])
 
-            if not is_entry_signal(latest):
-                if not stoch_pass:
-                    fail_reason = "stoch_xover"
+            # Windowed evaluation of all 4 conditions over recent CLOSED candles.
+            conds = evaluate_spot_conditions(df, drop_pct)
+
+            if not all(conds.values()):
+                # Structured rejection: log WHICH condition(s) failed so a
+                # future "no-trade" diagnosis is one log line away.
+                failed = [name for name, ok in conds.items() if not ok]
+                if not conds["stoch_xover"]:
                     n_stoch_fail += 1
-                elif not macd_pass:
-                    fail_reason = "macd_reversal"
+                if not conds["macd_rising"]:
                     n_macd_fail += 1
-                else:
-                    fail_reason = "volume_spike"
+                if not conds["volume_spike"]:
                     n_vol_spike_fail += 1
                 logger.debug(
                     f"{asset} | drop={drop_pct:+.2f}% | vol={vol_val:.0f} | "
                     f"stoch_k={stoch_k:.1f} | stoch_d={stoch_d:.1f} | "
-                    f"macd_hist={macd_hist:+.4f} | verdict=FAIL {fail_reason}"
+                    f"macd_hist={macd_hist:+.4f} | "
+                    f"conds={conds} | verdict=FAIL {','.join(failed)}"
                 )
                 continue
 
             logger.debug(
                 f"{asset} | drop={drop_pct:+.2f}% | vol={vol_val:.0f} | "
                 f"stoch_k={stoch_k:.1f} | stoch_d={stoch_d:.1f} | "
-                f"macd_hist={macd_hist:+.4f} | verdict=PASS"
+                f"macd_hist={macd_hist:+.4f} | conds={conds} | verdict=PASS"
             )
 
             avg_prev = df["volume"].iloc[-5:-2].mean()
@@ -233,7 +237,7 @@ class SpotStrategy(BaseStrategy):
                 asset=asset,
                 price=float(latest["close"]),
                 timestamp_ms=int(latest.name),
-                reason="spot:stoch_xover+macd_rev+vol_spike",
+                reason="spot:stoch_xover+macd_rising+vol_spike(windowed)",
                 indicators_snapshot={
                     "stoch_k": float(latest["stoch_rsi_k"]),
                     "stoch_d": float(latest["stoch_rsi_d"]),
@@ -274,7 +278,7 @@ class SpotStrategy(BaseStrategy):
         if not signals:
             rejections = {
                 "stoch_xover": n_stoch_fail,
-                "macd_reversal": n_macd_fail,
+                "macd_rising": n_macd_fail,
                 "volume_spike": n_vol_spike_fail,
                 "candle_fetch": n_candle_fail,
                 "insufficient_data": n_insufficient_data,
