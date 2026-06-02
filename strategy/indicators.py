@@ -24,17 +24,31 @@ def compute_stoch_rsi(df: pd.DataFrame, length: int = 14, k_smooth: int = 3,
     )
     df["stoch_rsi_k"] = indicator.stochrsi_k() * 100
     df["stoch_rsi_d"] = indicator.stochrsi_d() * 100
+    return compute_stoch_golden_cross(df, oversold=oversold)
 
+
+def compute_stoch_golden_cross(df: pd.DataFrame, oversold: float = 20) -> pd.DataFrame:
+    """Flag a Stoch-RSI golden cross in oversold territory.
+
+    Operates on existing `stoch_rsi_k`/`stoch_rsi_d` columns so it can be
+    exercised with synthetic K/D series (regression tests) as well as from
+    compute_stoch_rsi().
+    """
     k_curr = df["stoch_rsi_k"]
     k_prev = df["stoch_rsi_k"].shift(1)
     d_curr = df["stoch_rsi_d"]
     d_prev = df["stoch_rsi_d"].shift(1)
 
+    # Golden cross = K crosses above D. Confirm oversold on the bar BEFORE the
+    # cross (k_prev/d_prev, where K was still below D) — at the cross bar K may
+    # already have risen to/through the threshold (PENGU: K jumped 0 -> 20 on
+    # the cross). Use `<=` so a value sitting exactly on the threshold (e.g.
+    # k_prev=20) still counts as oversold.
     df["stoch_golden_cross"] = (
         (k_curr > d_curr) &
         (k_prev <= d_prev) &
-        (k_curr < oversold) &
-        (d_curr < oversold)
+        (k_prev <= oversold) &
+        (d_prev <= oversold)
     )
     return df
 
