@@ -154,7 +154,7 @@ class DerivativeStrategy(BaseStrategy):
                 lookback=DERIVATIVE["support_resistance_lookback_candles"],
                 pivot_window=DERIVATIVE["support_resistance_pivot_window"],
             )
-            current_price = float(df["close"].iloc[-1])
+            current_price = float(df["close"].iloc[-2])
             oi_change = self.oi_tracker.get_change_pct(asset, DERIVATIVE["oi_flush_lookback_candles"])
 
             signal = None

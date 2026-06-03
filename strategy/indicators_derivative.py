@@ -84,19 +84,19 @@ def is_cvd_falling(df: pd.DataFrame, window: int = 3) -> bool:
 
 def is_cvd_bullish_divergence(df: pd.DataFrame, window: int = 5) -> bool:
     """Harga flat/turun, CVD naik → bullish divergence di area support."""
-    if len(df) < window + 1:
+    if len(df) < window + 2:
         return False
-    price_change = df["close"].iloc[-1] - df["close"].iloc[-window - 1]
-    cvd_change = df["cvd"].iloc[-1] - df["cvd"].iloc[-window - 1]
+    price_change = df["close"].iloc[-2] - df["close"].iloc[-window - 2]
+    cvd_change = df["cvd"].iloc[-2] - df["cvd"].iloc[-window - 2]
     return price_change <= 0 and cvd_change > 0
 
 
 def is_cvd_bearish_divergence(df: pd.DataFrame, window: int = 5) -> bool:
     """Harga flat/naik, CVD turun → bearish divergence di area resistance."""
-    if len(df) < window + 1:
+    if len(df) < window + 2:
         return False
-    price_change = df["close"].iloc[-1] - df["close"].iloc[-window - 1]
-    cvd_change = df["cvd"].iloc[-1] - df["cvd"].iloc[-window - 1]
+    price_change = df["close"].iloc[-2] - df["close"].iloc[-window - 2]
+    cvd_change = df["cvd"].iloc[-2] - df["cvd"].iloc[-window - 2]
     return price_change >= 0 and cvd_change < 0
 
 
