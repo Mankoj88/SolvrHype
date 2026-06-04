@@ -107,14 +107,19 @@ class DerivativeStrategy(BaseStrategy):
         now_ms = int(time.time() * 1000)
 
         # ---- Stage 1: ctx-only pre-filter + OI snapshot (0 API call/asset) ----
+        n_seen = n_oi_recorded = n_funding_pass = n_flush_pass = 0
+        max_oi_drop_seen = 0.0  # most negative OI change% across assets this cycle
+
         candidates = []   # (asset, ctx, funding, long_setup)
         for asset, ctx in self._universe.iter_assets():
+            n_seen += 1
             try:
                 oi = float(ctx.get("openInterest", 0) or 0)
             except (TypeError, ValueError):
                 oi = 0
             if oi > 0:
                 self.oi_tracker.record(asset, oi, now_ms)
+                n_oi_recorded += 1
 
             try:
                 funding = float(ctx.get("funding", 0) or 0)
@@ -125,26 +130,39 @@ class DerivativeStrategy(BaseStrategy):
             short_setup = funding > DERIVATIVE["funding_rate_positive_threshold"]
             if not (long_setup or short_setup):
                 continue
+            n_funding_pass += 1
+
+            drop = self.oi_tracker.get_change_pct(asset, DERIVATIVE["oi_flush_lookback_candles"])
+            max_oi_drop_seen = min(max_oi_drop_seen, drop)
 
             if not self.oi_tracker.detect_flush(asset, DERIVATIVE["oi_flush_drop_pct"]):
                 continue
+            n_flush_pass += 1
 
             candidates.append((asset, ctx, funding, long_setup, short_setup))
 
         if not candidates:
+            logger.info(
+                f"Deriv scan: 0 candidates | seen={n_seen} oi_recorded={n_oi_recorded} "
+                f"funding_pass={n_funding_pass} flush_pass={n_flush_pass} | "
+                f"max_oi_drop_seen={max_oi_drop_seen:.1f}% (threshold -{DERIVATIVE['oi_flush_drop_pct']}%) | "
+                f"oi_tracker_assets={len(self.oi_tracker.history)}"
+            )
+            self.oi_tracker.save()
             return []
 
         # Cap survivors (defense in depth — biasanya OI flush sudah restrictive)
         candidates = candidates[:MAX_CANDIDATES_PER_CYCLE]
-        logger.info(f"Deriv scan: {len(candidates)} survivors after OI flush filter")
 
         # ---- Stage 2: 5m candles untuk survivors ----
+        n_candle_fail = n_not_at_level = n_no_signal = 0
         for i, (asset, ctx, funding, long_setup, short_setup) in enumerate(candidates):
             if i > 0 and CANDLE_FETCH_INTER_CALL_SLEEP_SEC > 0:
                 time.sleep(CANDLE_FETCH_INTER_CALL_SLEEP_SEC)
 
             df = self._fetch_5m_candles(asset)
             if df is None:
+                n_candle_fail += 1
                 continue
             df = compute_cvd(df)
             df = detect_volume_spike(df, lookback=DERIVATIVE["cvd_rising_window"], multiplier=1.5)
@@ -158,10 +176,18 @@ class DerivativeStrategy(BaseStrategy):
             oi_change = self.oi_tracker.get_change_pct(asset, DERIVATIVE["oi_flush_lookback_candles"])
 
             signal = None
+            branch_ran = False
             if long_setup and self._at_level(current_price, sr["support"]):
+                branch_ran = True
                 signal = self._try_long_signal(asset, df, sr, current_price, funding, oi_change, now_ms)
             elif short_setup and self._at_level(current_price, sr["resistance"]):
+                branch_ran = True
                 signal = self._try_short_signal(asset, df, sr, current_price, funding, oi_change, now_ms)
+
+            if not branch_ran:
+                n_not_at_level += 1
+            elif signal is None:
+                n_no_signal += 1
 
             if signal:
                 signals.append(signal)
@@ -172,6 +198,13 @@ class DerivativeStrategy(BaseStrategy):
                 )
                 if len(signals) >= 2:
                     break
+        self.oi_tracker.save()
+        logger.info(
+            f"Deriv funnel: seen={n_seen} funding_pass={n_funding_pass} flush_pass={n_flush_pass} "
+            f"survivors={len(candidates)} | stage2: candle_fail={n_candle_fail} "
+            f"not_at_level={n_not_at_level} no_signal={n_no_signal} signals={len(signals)} | "
+            f"max_oi_drop_seen={max_oi_drop_seen:.1f}%"
+        )
         return signals
 
     # --------------------------------------------------------------- long path

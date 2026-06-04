@@ -13,6 +13,7 @@ Dual-strategy support (spot + derivative):
 """
 import time
 import json
+import pandas as pd
 from dataclasses import dataclass, asdict, fields
 from typing import Optional
 from loguru import logger
@@ -27,6 +28,7 @@ from config import (
     LEVERAGE, USE_ISOLATED_MARGIN, SLIPPAGE_TOLERANCE, DRY_RUN, DATA_DIR,
     COOLDOWN_AFTER_CLOSE_MINUTES,
     SPOT, DERIVATIVE,
+    PSAR_STEP, PSAR_MAX_STEP, PSAR_HOLD_MAX_HOURS,
 )
 from strategy.base_strategy import TradeSignal
 
@@ -352,6 +354,37 @@ class OrderManager:
             return DERIVATIVE["max_hold_hours"]
         return MAX_HOLD_HOURS
 
+    def _fetch_candles_for_psar(self, asset):
+        try:
+            now = int(time.time() * 1000)
+            start = now - 100 * 300_000  # 100 x 5m
+            candles = self.info.candles_snapshot(asset, "5m", start, now)
+            if not candles or len(candles) < 10:
+                return None
+            return pd.DataFrame([
+                {"high": float(c["h"]), "low": float(c["l"]), "close": float(c["c"])}
+                for c in candles
+            ])
+        except Exception as e:
+            logger.warning(f"PSAR candle fetch failed {asset}: {e}")
+            return None
+
+    def _psar_favors_hold(self, pos) -> bool:
+        """True if PSAR still favors the trade direction (long: SAR<price, short: SAR>price).
+        Conservative: if candles unavailable, return False (i.e. allow close)."""
+        df = self._fetch_candles_for_psar(pos.asset)
+        if df is None or len(df) < 10:
+            return False
+        from strategy.indicators import compute_psar
+        try:
+            sar = compute_psar(df, step=PSAR_STEP, max_step=PSAR_MAX_STEP)
+            price = float(df["close"].iloc[-2])   # closed candle
+            sar_val = float(sar.iloc[-2])
+        except Exception as e:
+            logger.warning(f"PSAR compute failed {pos.asset}: {e}")
+            return False
+        return sar_val < price if pos.is_long else sar_val > price
+
     # ------------------------------------------------------------------ entry
 
     def execute_entry(self, signal: TradeSignal, size_usd: float) -> bool:
@@ -518,10 +551,17 @@ class OrderManager:
             time_held_hours = (time.time() * 1000 - pos.entry_time_ms) / 3600_000
 
             if time_held_hours >= self._max_hold_hours(pos):
-                logger.info(f"⏰ MAX_HOLD {asset}: {time_held_hours:.1f}h, force close")
-                self._close_full_position(asset, "max_hold", current_price)
-                positions_to_remove.append(asset)
-                continue
+                favors_hold = self._psar_favors_hold(pos)
+                if favors_hold and time_held_hours < PSAR_HOLD_MAX_HOURS:
+                    logger.info(f"⏳ HOLD_EXTEND {asset}: {time_held_hours:.1f}h, PSAR still favors "
+                                f"{'long' if pos.is_long else 'short'} — holding (TP/SL still active)")
+                    # fall through to SL/TP checks; do NOT continue
+                else:
+                    reason = "max_hold_ceiling" if favors_hold else "max_hold_psar_flip"
+                    logger.info(f"⏰ MAX_HOLD {asset}: {time_held_hours:.1f}h close ({reason})")
+                    self._close_full_position(asset, reason, current_price)
+                    positions_to_remove.append(asset)
+                    continue
 
             if self._sl_triggered(pos, current_price):
                 logger.warning(

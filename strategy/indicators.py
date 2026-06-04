@@ -53,6 +53,14 @@ def compute_stoch_golden_cross(df: pd.DataFrame, oversold: float = 20) -> pd.Dat
     return df
 
 
+def compute_psar(df, step=0.02, max_step=0.2):
+    """Parabolic SAR series aligned to df index. Uses ta.trend.PSARIndicator."""
+    from ta.trend import PSARIndicator
+    ind = PSARIndicator(high=df["high"], low=df["low"], close=df["close"],
+                        step=step, max_step=max_step, fillna=False)
+    return ind.psar()
+
+
 def compute_macd(df: pd.DataFrame, fast: int = 12, slow: int = 26,
                  signal: int = 9) -> pd.DataFrame:
     """MACD with histogram reversal detection (negatif → positif)."""

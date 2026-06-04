@@ -45,6 +45,11 @@ MACD_SIGNAL = 10
 VOLUME_SPIKE_LOOKBACK = 3           # 3 candle sebelumnya (legacy/deriv path)
 VOLUME_SPIKE_MULTIPLIER = 1.5
 
+# Parabolic SAR (runner exit gate past max_hold)
+PSAR_STEP = 0.02
+PSAR_MAX_STEP = 0.2
+PSAR_HOLD_MAX_HOURS = 24  # absolute ceiling beyond 6h to prevent infinite hold
+
 # === SPOT WINDOWED-CONFIRMATION PARAMS (closed candles only) ===
 # Conditions 2-4 confirm over a short window of recent CLOSED candles instead
 # of demanding all three line up on the single entry candle (the old 0-trades
@@ -106,7 +111,7 @@ SPOT = {
     "cutloss_pct": -2.0,
     # (tp_pct, sell_fraction_of_remaining, post_action)
     "take_profits": [(2.0, 0.50, "breakeven"), (5.0, 1.00, None)],
-    "max_hold_hours": 2.0,
+    "max_hold_hours": 6.0,
     "leverage": 1,
     "allocation_split": [0.30, 0.30, 0.40],  # 1-3 aset
 }
@@ -128,7 +133,7 @@ DERIVATIVE = {
     "risk_per_trade_pct": 1.5,              # % dari TOTAL equity
     "max_leverage": 5,
     "take_profits": [(2.0, 0.50, "breakeven"), (5.0, 1.00, None)],
-    "max_hold_hours": 2.0,
+    "max_hold_hours": 6.0,
 }
 
 # === RISK MANAGEMENT [HARD LIMITS — DO NOT MODIFY] ===
@@ -152,16 +157,19 @@ SPOT_MIN_POSITION_FLOOR = 10
 HL_PLATFORM_MIN_ORDER_USD = 10
 USE_ISOLATED_MARGIN = True
 MAX_CONSECUTIVE_LOSSES = 7
-MAX_DAILY_LOSS_PCT = 10.0
-# Rescaled for ~$40 account (operator, 2026-06-02): ~10% of balance, so the USD
-# branch aligns with the 10% pct branch instead of being dead weight.
-MAX_DAILY_LOSS_USD = 4
+# Net deposited principal. Update via .env on each top-up (no redeploy).
+# Risk limits below derive from this so they scale with the account.
+INITIAL_CAPITAL_USD = float(os.getenv("INITIAL_CAPITAL_USD", "128.08"))
+MAX_DAILY_LOSS_PCT = 5.0
+# Derived from INITIAL_CAPITAL_USD: daily loss cap = 5% of principal.
+# The MAX_DAILY_LOSS_PCT branch additionally scales with live equity.
+MAX_DAILY_LOSS_USD = round(INITIAL_CAPITAL_USD * 0.05, 2)
 
 # === STOP-LOSS RULE (3 bulan komitmen) ===
 EVALUATION_PERIOD_DAYS = 90
 # Rescaled 200 -> 20 (operator, 2026-06-02): ~50% of a ~$40 account, so the
 # 3-month halt can actually fire before the account is depleted.
-EVALUATION_LOSS_THRESHOLD_USD = 20
+EVALUATION_LOSS_THRESHOLD_USD = round(INITIAL_CAPITAL_USD * 0.20, 2)
 
 # === ALLOCATION ===
 def get_allocation(capital: float) -> list[float]:
@@ -220,10 +228,6 @@ def get_api_url() -> str:
         return "https://api.hyperliquid-testnet.xyz"
     return "https://api.hyperliquid.xyz"
 
-# === INITIAL CAPITAL (untuk stop-loss enforcer) ===
-# Rescaled 500 -> 40 (operator, 2026-06-02) to match the real live balance
-# (~$39.94) so the enforcer's baseline / pct accounting is correct.
-INITIAL_CAPITAL_USD = 40
 # Rate limit fix — max candidates per scan cycle
 MAX_CANDIDATES_PER_CYCLE = int(os.getenv('MAX_CANDIDATES_PER_CYCLE', '20'))
 

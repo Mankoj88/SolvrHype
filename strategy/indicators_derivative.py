@@ -8,10 +8,14 @@ Indikator khusus untuk DerivativeStrategy:
 - Liquidation map proxy (heuristik OI+funding+distance)
 """
 import time
+import json
+from pathlib import Path
 from collections import defaultdict, deque
 from typing import Optional
 import numpy as np
 import pandas as pd
+
+from config import DATA_DIR
 
 
 # ============================================================== Open Interest
@@ -26,6 +30,31 @@ class OITracker:
     def __init__(self, max_history: int = 24):
         self.max_history = max_history
         self.history: dict[str, deque] = defaultdict(lambda: deque(maxlen=max_history))
+        self._state_file = DATA_DIR / "oi_history.json"
+        self._load()
+
+    def _load(self):
+        if not self._state_file.exists():
+            return
+        try:
+            data = json.load(open(self._state_file))
+            cutoff = int(time.time() * 1000) - 60 * 60 * 1000  # drop >60min stale
+            for asset, recs in data.items():
+                fresh = [(int(ts), float(v)) for ts, v in recs if int(ts) >= cutoff]
+                if fresh:
+                    self.history[asset] = deque(fresh, maxlen=self.max_history)
+        except Exception:
+            pass  # corrupt → start fresh
+
+    def save(self):
+        try:
+            self._state_file.parent.mkdir(parents=True, exist_ok=True)
+            data = {a: list(h) for a, h in self.history.items()}
+            tmp = self._state_file.with_suffix(".tmp")
+            json.dump(data, open(tmp, "w"))
+            tmp.replace(self._state_file)
+        except Exception:
+            pass
 
     def record(self, asset: str, oi_value: float, ts_ms: Optional[int] = None):
         ts = ts_ms if ts_ms is not None else int(time.time() * 1000)
