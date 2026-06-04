@@ -105,8 +105,8 @@ SPOT = {
     "volume_spike_window": VOLUME_SPIKE_WINDOW,
     "cutloss_pct": -2.0,
     # (tp_pct, sell_fraction_of_remaining, post_action)
-    "take_profits": [(5.0, 0.50, "breakeven"), (10.0, 0.50, None), (20.0, 1.00, None)],
-    "max_hold_hours": 6,
+    "take_profits": [(2.0, 0.50, "breakeven"), (5.0, 1.00, None)],
+    "max_hold_hours": 2.0,
     "leverage": 1,
     "allocation_split": [0.30, 0.30, 0.40],  # 1-3 aset
 }
@@ -127,8 +127,8 @@ DERIVATIVE = {
     "structure_break_buffer_pct": 0.005,    # 0.5% buffer
     "risk_per_trade_pct": 1.5,              # % dari TOTAL equity
     "max_leverage": 5,
-    "take_profits": [(5.0, 0.50, "breakeven"), (10.0, 0.50, None), (20.0, 1.00, None)],
-    "max_hold_hours": 6,
+    "take_profits": [(2.0, 0.50, "breakeven"), (5.0, 1.00, None)],
+    "max_hold_hours": 2.0,
 }
 
 # === RISK MANAGEMENT [HARD LIMITS — DO NOT MODIFY] ===

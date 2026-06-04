@@ -221,8 +221,8 @@ class OrderManager:
                     continue
                 size_coin = abs(float(pos_data["szi"]))
                 is_long = float(pos_data["szi"]) > 0
-                sl_price = entry_price * (1 + CUTLOSS_PCT / 100) if is_long \
-                    else entry_price * (1 - CUTLOSS_PCT / 100)
+                sl_price = entry_price * (1 + SPOT["cutloss_pct"] / 100) if is_long \
+                    else entry_price * (1 - SPOT["cutloss_pct"] / 100)
                 self.positions[asset] = Position(
                     asset=asset,
                     entry_price=entry_price,
@@ -230,7 +230,7 @@ class OrderManager:
                     remaining_size_coin=size_coin,
                     entry_size_usd=size_coin * entry_price,
                     entry_time_ms=int(time.time() * 1000),
-                    tp_levels_remaining=_normalize_tp_levels(TAKE_PROFITS),
+                    tp_levels_remaining=_normalize_tp_levels(SPOT["take_profits"]),
                     initial_sl_price=sl_price,
                     current_sl_price=sl_price,
                     strategy_type="spot",
