@@ -77,6 +77,11 @@ ENABLE_DERIVATIVE_STRATEGY = os.getenv("ENABLE_DERIVATIVE", "false").lower() == 
 # cycle. Cycle = 60s, jadi cache 60s = 1 API call/menit untuk universe.
 UNIVERSE_REFRESH_INTERVAL_SECONDS = 60
 
+# === LOOP CADENCE (two concurrent async loops) ===
+SCAN_CYCLE_SECONDS = 300         # spot scan + management base loop runs every 5 min
+POSITION_MANAGE_INTERVAL_SECONDS = 60   # position management loop
+DERIVATIVE_SCAN_EVERY_N_CYCLES = 2      # 2 × 300s = 600s (10 min)
+
 # Hard cap survivor count yang di-fetch 5m candles per cycle. Mencegah
 # burst calls saat banyak aset lolos ctx pre-filter. 20 × 1 call/asset
 # = 20 calls/min, jauh di bawah HL rate limit (~60/min).
@@ -95,19 +100,25 @@ SPOT = {
     "candle_lookback": 120,
     "min_7d_avg_daily_volume_usd": 100_000,   # legacy key (deriv/other paths)
     "scan_min_24h_volume_usd": SCAN_MIN_24H_VOLUME_USD,  # spot gate per spec
-    "min_daily_drop_pct": 2.0,            # -2% vs close kemarin
+    "min_daily_drop_pct": 2.0,            # stage-1 ctx 24h pre-filter (markPx/prevDayPx)
+    "drop_pct": -5.0,                     # stage-2: % drop from 72-bar high on 5m timeframe (~6 hours)
+    "drop_lookback_candles": 72,          # 72 × 5m = 6 hours
     "max_entry_slippage_pct": 0.3,
     "stoch_rsi_length": 10,
     "stoch_rsi_k_smooth": 5,
     "stoch_rsi_d_smooth": 5,
     "stoch_rsi_oversold": 20,
-    "stoch_cross_lookback": STOCH_CROSS_LOOKBACK,
+    "stoch_cross_lookback": 1,           # cross must occur at the last closed candle only
     "macd_fast": 10, "macd_slow": 30, "macd_signal": 10,
-    "macd_hist_rising_bars": MACD_HIST_RISING_BARS,
+    "macd_turning_negative": True,       # hist[-2] negative & |hist[-2]| < |hist[-3]|
     "vol_spike_lookback": 3,              # legacy key (unused by spot windowed path)
     "vol_spike_multiplier": 1.5,
     "volume_sma_period": VOLUME_SMA_PERIOD,
-    "volume_spike_window": VOLUME_SPIKE_WINDOW,
+    "volume_spike_window": VOLUME_SPIKE_WINDOW,  # legacy key (evaluate_spot_conditions)
+    "volume_lookback_candles": 72,
+    "volume_burst_multiplier": 1.5,
+    "volume_burst_min_bars": 1,
+    "volume_burst_max_bars": 3,
     "cutloss_pct": -2.0,
     # (tp_pct, sell_fraction_of_remaining, post_action)
     "take_profits": [(2.0, 0.50, "breakeven"), (5.0, 1.00, None)],
@@ -118,12 +129,12 @@ SPOT = {
 
 DERIVATIVE = {
     "timeframe": "5m",
-    "candle_lookback": 120,
-    "oi_flush_lookback_candles": 12,        # 1 jam window (12 × 5m)
-    "oi_flush_drop_pct": 15.0,              # OI turun >15% = flush
+    "candle_lookback": 100,                 # ≥72 for 6h S/R; 100 gives swing/CVD buffer
+    "oi_flush_lookback_candles": 36,        # 3 jam window (36 × 5m)
+    "oi_flush_drop_pct": 7.0,               # OI turun >7% = flush
     "cvd_rising_window": 3,                 # 3 × 5m
-    "funding_rate_negative_threshold": -0.0005,  # -0.05% → long setup
-    "funding_rate_positive_threshold": 0.0005,   # +0.05% → short setup
+    "funding_rate_negative_threshold": -0.0002,  # -0.02% → long setup
+    "funding_rate_positive_threshold": 0.0002,   # +0.02% → short setup
     "support_resistance_lookback_candles": 96,   # ~8 jam
     "support_resistance_pivot_window": 5,
     "support_proximity_pct": 0.01,          # ±1% dari S/R level

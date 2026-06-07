@@ -13,6 +13,8 @@ from config import (
     DRY_RUN, USE_TESTNET, LOGS_DIR, MAX_OPEN_POSITIONS, get_api_url,
     HYPERLIQUID_ACCOUNT, INITIAL_CAPITAL_USD,
     MAX_OPEN_POSITIONS_PER_STRATEGY, ENABLE_DERIVATIVE_STRATEGY,
+    SCAN_CYCLE_SECONDS, POSITION_MANAGE_INTERVAL_SECONDS,
+    DERIVATIVE_SCAN_EVERY_N_CYCLES,
 )
 from strategy.spot_strategy import SpotStrategy
 from strategy.universe import UniverseFetcher
@@ -49,7 +51,9 @@ class Solvira:
     def __init__(self):
         self.info = Info(get_api_url(), skip_ws=True)
         self.universe = UniverseFetcher(self.info)
-        self.spot_strategy = SpotStrategy(self.info, self.universe)
+        # OrderManager first: SpotStrategy needs it for the anti-duplicate gate.
+        self.order_manager = OrderManager()
+        self.spot_strategy = SpotStrategy(self.info, self.universe, self.order_manager)
         self.derivative_strategy = None
         if ENABLE_DERIVATIVE_STRATEGY:
             try:
@@ -58,7 +62,9 @@ class Solvira:
                 logger.info("Derivative strategy ENABLED")
             except ImportError as e:
                 logger.warning(f"Derivative strategy not available yet: {e}")
-        self.order_manager = OrderManager()
+        # Serializes capital reads, scans, and position management between the
+        # two concurrent async loops.
+        self.state_lock = asyncio.Lock()
         # Pass info so spot sizing can resolve the exchange-min order notional.
         self.allocation_manager = AllocationManager(self.info)
         self.withdraw_manager = WithdrawManager()
@@ -93,87 +99,100 @@ class Solvira:
             logger.warning(f"Failed to fetch prices: {e}")
             return {}
     
-    async def trading_cycle(self):
-        self.health.heartbeat()
-        
-        # Stop-loss 3-bulan rule
-        can_trade, reason = self.stop_loss_enforcer.check()
-        if not can_trade:
-            logger.warning(f"3-month stop-loss enforcer: {reason}")
-            return
-        
-        # Health circuit breakers
-        can_trade, reason = self.health.can_trade()
-        if not can_trade:
-            logger.warning(f"Health monitor: {reason}")
-            return
-        
-        capital = self.get_total_capital()
-        if capital == 0 and not DRY_RUN:
-            logger.warning("Capital is 0, skip cycle")
-            return
-        elif capital == 0 and DRY_RUN:
-            capital = INITIAL_CAPITAL_USD
-        
-        # 1. Manage existing positions
-        if self.order_manager.positions:
-            assets = list(self.order_manager.positions.keys())
-            current_prices = self.get_current_prices(assets)
-            self.order_manager.manage_open_positions(current_prices)
-        
-        # 2. Scan dual strategy paralel
-        self.health.open_positions_count = self.order_manager.open_position_count()
-        open_by_strat = self.order_manager.open_position_count_by_strategy()
+    async def position_management_loop(self):
+        """Runs every POSITION_MANAGE_INTERVAL_SECONDS. Manages open positions only."""
+        while True:
+            try:
+                async with self.state_lock:
+                    if self.order_manager.positions:
+                        assets = list(self.order_manager.positions.keys())
+                        current_prices = self.get_current_prices(assets)
+                        self.order_manager.manage_open_positions(current_prices)
+                self.health.heartbeat()
+            except Exception as e:
+                logger.exception(f"Position management error: {e}")
+                self.health.on_error(error_type=type(e).__name__)
+            await asyncio.sleep(POSITION_MANAGE_INTERVAL_SECONDS)
 
-        scan_tasks = []
-        if open_by_strat.get("spot", 0) < MAX_OPEN_POSITIONS_PER_STRATEGY["spot"]:
-            scan_tasks.append(("spot", asyncio.to_thread(self.spot_strategy.scan)))
-        if (self.derivative_strategy is not None
-                and open_by_strat.get("derivative", 0) < MAX_OPEN_POSITIONS_PER_STRATEGY["derivative"]):
-            scan_tasks.append(("derivative", asyncio.to_thread(self.derivative_strategy.scan)))
-
-        all_signals = []
-        if scan_tasks:
-            results = await asyncio.gather(
-                *(t for _, t in scan_tasks), return_exceptions=True
-            )
-            for (label, _), result in zip(scan_tasks, results):
-                if isinstance(result, RuntimeError):
-                    # Expected: API unavailable after retries — skip this cycle, keep loop alive
-                    logger.warning(f"{label} scan cycle skipped (API unavailable): {result}")
+    async def scan_and_entry_loop(self):
+        """Runs every SCAN_CYCLE_SECONDS. Spot every cycle, derivative every DERIVATIVE_SCAN_EVERY_N_CYCLES cycles."""
+        cycle_counter = 0
+        while True:
+            try:
+                # Existing pre-trade checks (3-month stop-loss enforcer, health circuit breakers)
+                can_trade, reason = self.stop_loss_enforcer.check()
+                if not can_trade:
+                    logger.warning(f"3-month stop-loss enforcer: {reason}")
+                    await asyncio.sleep(SCAN_CYCLE_SECONDS)
                     continue
-                if isinstance(result, Exception):
-                    logger.exception(
-                        f"{label} scan cycle unexpected error: {result}",
-                        exc_info=result,
-                    )
+                can_trade, reason = self.health.can_trade()
+                if not can_trade:
+                    logger.warning(f"Health monitor: {reason}")
+                    await asyncio.sleep(SCAN_CYCLE_SECONDS)
                     continue
-                all_signals.extend(result)
 
-        for signal in all_signals:
-            if self.health.open_positions_count >= MAX_OPEN_POSITIONS:
-                break
-            size_usd = self.allocation_manager.calculate_position_size(
-                asset=signal.asset,
-                total_capital=capital,
-                strategy_type=signal.strategy_type,
-                signal=signal,
-            )
-            if size_usd <= 0:
-                continue
+                async with self.state_lock:
+                    capital = self.get_total_capital()
+                    if capital == 0 and not DRY_RUN:
+                        logger.warning("Capital is 0, skip cycle")
+                        await asyncio.sleep(SCAN_CYCLE_SECONDS)
+                        continue
+                    elif capital == 0 and DRY_RUN:
+                        capital = INITIAL_CAPITAL_USD
 
-            success = self.order_manager.execute_entry(signal, size_usd)
-            if success:
-                self.allocation_manager.reserve(signal.asset, size_usd, signal.strategy_type)
-                self.health.open_positions_count += 1
-                self.health.last_signal_time = time.time()
-        
-        # 3. Withdraw threshold check
-        if self.withdraw_manager.should_withdraw():
-            self.withdraw_manager.execute_withdraw()
-        
-        self.health.on_success()
-    
+                    self.health.open_positions_count = self.order_manager.open_position_count()
+                    open_by_strat = self.order_manager.open_position_count_by_strategy()
+
+                    scan_tasks = []
+                    if open_by_strat.get("spot", 0) < MAX_OPEN_POSITIONS_PER_STRATEGY["spot"]:
+                        scan_tasks.append(("spot", asyncio.to_thread(self.spot_strategy.scan)))
+
+                    run_derivative = (cycle_counter % DERIVATIVE_SCAN_EVERY_N_CYCLES == 0)
+                    if (run_derivative
+                            and self.derivative_strategy is not None
+                            and open_by_strat.get("derivative", 0) < MAX_OPEN_POSITIONS_PER_STRATEGY["derivative"]):
+                        scan_tasks.append(("derivative", asyncio.to_thread(self.derivative_strategy.scan)))
+
+                    all_signals = []
+                    if scan_tasks:
+                        results = await asyncio.gather(*(t for _, t in scan_tasks), return_exceptions=True)
+                        for (label, _), result in zip(scan_tasks, results):
+                            if isinstance(result, RuntimeError):
+                                logger.warning(f"{label} scan cycle skipped (API unavailable): {result}")
+                                continue
+                            if isinstance(result, Exception):
+                                logger.exception(f"{label} scan cycle unexpected error: {result}", exc_info=result)
+                                continue
+                            all_signals.extend(result)
+
+                    for signal in all_signals:
+                        if self.health.open_positions_count >= MAX_OPEN_POSITIONS:
+                            break
+                        size_usd = self.allocation_manager.calculate_position_size(
+                            asset=signal.asset,
+                            total_capital=capital,
+                            strategy_type=signal.strategy_type,
+                            signal=signal,
+                        )
+                        if size_usd <= 0:
+                            continue
+                        success = self.order_manager.execute_entry(signal, size_usd)
+                        if success:
+                            self.allocation_manager.reserve(signal.asset, size_usd, signal.strategy_type)
+                            self.health.open_positions_count += 1
+                            self.health.last_signal_time = time.time()
+
+                    if self.withdraw_manager.should_withdraw():
+                        self.withdraw_manager.execute_withdraw()
+                    self.health.on_success()
+
+                cycle_counter += 1
+            except Exception as e:
+                logger.exception(f"Scan loop error: {e}")
+                self.health.on_error(error_type=type(e).__name__)
+                notify_critical_error(str(e), error_type=type(e).__name__)
+            await asyncio.sleep(SCAN_CYCLE_SECONDS)
+
     def _run_schedule_loop(self):
         """Bug #13: run schedule in a daemon thread so it never blocks the asyncio loop."""
         while not self._schedule_stop.is_set():
@@ -182,28 +201,21 @@ class Solvira:
 
     async def main_loop(self):
         notify_startup()
-        logger.info(f"Solvira started. TESTNET={USE_TESTNET}, DRY_RUN={DRY_RUN}")
-
+        logger.info(f"Solvira started. TESTNET={USE_TESTNET}, DRY_RUN={DRY_RUN}, "
+                    f"scan_interval={SCAN_CYCLE_SECONDS}s, "
+                    f"position_interval={POSITION_MANAGE_INTERVAL_SECONDS}s, "
+                    f"deriv_every={DERIVATIVE_SCAN_EVERY_N_CYCLES}")
         schedule.every().day.at("23:59").do(self._daily_summary_job)
         schedule.every().monday.at("09:00").do(self._weekly_review_job)
         schedule.every().day.at("00:05").do(self._daily_snapshot_job)
-
-        # Bug #13: schedule runs in its own thread — won't block trading cycle
-        schedule_thread = threading.Thread(
-            target=self._run_schedule_loop, daemon=True, name="schedule-loop"
-        )
+        schedule_thread = threading.Thread(target=self._run_schedule_loop, daemon=True, name="schedule-loop")
         schedule_thread.start()
 
         try:
-            while True:
-                try:
-                    await self.trading_cycle()
-                except Exception as e:
-                    logger.exception(f"Trading cycle error: {e}")
-                    self.health.on_error(error_type=type(e).__name__)
-                    notify_critical_error(str(e), error_type=type(e).__name__)
-
-                await asyncio.sleep(60)
+            await asyncio.gather(
+                self.position_management_loop(),
+                self.scan_and_entry_loop(),
+            )
         except KeyboardInterrupt:
             logger.info("Received interrupt, shutting down...")
             self._schedule_stop.set()

@@ -23,7 +23,11 @@ from config import (
     MAX_CANDIDATES_PER_CYCLE, CANDLE_FETCH_INTER_CALL_SLEEP_SEC,
 )
 from strategy.base_strategy import BaseStrategy, TradeSignal
-from strategy.indicators import compute_spot_indicators, evaluate_spot_conditions
+from strategy.indicators import (
+    compute_stoch_rsi, compute_macd,
+    compute_drop_pct, is_green_candle, is_stoch_golden_cross_now,
+    is_macd_turning_from_negative, has_concentrated_volume_burst,
+)
 from strategy.universe import UniverseFetcher
 
 
@@ -36,9 +40,13 @@ TIMEFRAME_MS = {
 class SpotStrategy(BaseStrategy):
     strategy_type = "spot"
 
-    def __init__(self, info: Info = None, universe: UniverseFetcher = None):
+    def __init__(self, info: Info = None, universe: UniverseFetcher = None,
+                 order_manager=None):
         self._info = info or Info(get_api_url(), skip_ws=True)
         self._universe = universe or UniverseFetcher(self._info)
+        # Used for the anti-duplicate gate in scan(): assets already held are
+        # skipped before any candle fetch (saves API calls too).
+        self._order_manager = order_manager
         self._candles_cache: dict[str, tuple] = {}        # asset → (df, ts)
 
     # =========================================================== STAGE 1
@@ -122,9 +130,15 @@ class SpotStrategy(BaseStrategy):
         n_ctx_invalid = 0
         n_vol_fail = 0
         n_drop_fail = 0
+        n_already_open = 0
         candidates: list[tuple[str, dict, float, float, float]] = []
         # (asset, ctx, mark_px, day_vol, drop_pct)
         for asset, ctx in self._universe.iter_assets():
+            # Anti-duplicate: never re-enter an asset we already hold. Done here,
+            # BEFORE any candle fetch, so dup assets never cost an API call.
+            if self._order_manager is not None and asset in self._order_manager.positions:
+                n_already_open += 1
+                continue
             if not self._passes_funding(ctx):
                 n_funding_fail += 1
                 continue
@@ -159,11 +173,20 @@ class SpotStrategy(BaseStrategy):
 
         # ---- Stage 2: 5m candles + indicators (1 API call per survivor) ----
         # Per-asset debug logging is OK here (≤ MAX_CANDIDATES_PER_CYCLE iterations).
+        # New spec: ALL of drop / green / stoch_xover / macd_turn / vol_burst must
+        # hold on the latest CLOSED candle (iloc[-2]).
         n_candle_fail = 0
         n_insufficient_data = 0
+        n_drop_window_fail = 0
+        n_green_fail = 0
         n_stoch_fail = 0
         n_macd_fail = 0
-        n_vol_spike_fail = 0
+        n_vol_burst_fail = 0
+        # Widest window the conditions look back over (+2 for the closed-candle
+        # contract: latest closed is iloc[-2], live candle iloc[-1] excluded).
+        min_bars_needed = max(
+            SPOT["drop_lookback_candles"], SPOT["volume_lookback_candles"]
+        ) + 2
         signals: list[TradeSignal] = []
         for i, (asset, ctx, mark, day_vol, drop_pct) in enumerate(capped):
             # Throttle untuk smoothing burst (defense in depth)
@@ -173,71 +196,90 @@ class SpotStrategy(BaseStrategy):
             df = self._fetch_5m_candles(asset)
             if df is None:
                 n_candle_fail += 1
-                logger.debug(
-                    f"{asset} | drop={drop_pct:+.2f}% | verdict=FAIL candle_fetch"
-                )
+                logger.debug(f"{asset} | verdict=FAIL candle_fetch")
                 continue
-            df = compute_spot_indicators(
-                df,
-                stoch_length=SPOT["stoch_rsi_length"],
-                stoch_k=SPOT["stoch_rsi_k_smooth"],
-                stoch_d=SPOT["stoch_rsi_d_smooth"],
-                stoch_oversold=SPOT["stoch_rsi_oversold"],
-                macd_fast=SPOT["macd_fast"],
-                macd_slow=SPOT["macd_slow"],
-                macd_signal=SPOT["macd_signal"],
-                volume_sma_period=SPOT["volume_sma_period"],
-                volume_spike_multiplier=SPOT["vol_spike_multiplier"],
-            )
-            # Need enough closed candles for the widest window (volume_spike_window).
-            if len(df) < SPOT["volume_spike_window"] + 2:
+            if len(df) < min_bars_needed:
                 n_insufficient_data += 1
                 logger.debug(
-                    f"{asset} | drop={drop_pct:+.2f}% | verdict=FAIL insufficient_data "
-                    f"(bars={len(df)} < {SPOT['volume_spike_window'] + 2})"
-                )
-                continue
-            latest = df.iloc[-2]   # latest CLOSED candle (never iloc[-1])
-
-            stoch_k = float(latest["stoch_rsi_k"]) if pd.notna(latest["stoch_rsi_k"]) else float("nan")
-            stoch_d = float(latest["stoch_rsi_d"]) if pd.notna(latest["stoch_rsi_d"]) else float("nan")
-            macd_hist = float(latest["macd_hist"]) if pd.notna(latest["macd_hist"]) else float("nan")
-            vol_val = float(latest["volume"])
-
-            # Windowed evaluation of all 4 conditions over recent CLOSED candles.
-            conds = evaluate_spot_conditions(df, drop_pct)
-
-            if not all(conds.values()):
-                # Structured rejection: log WHICH condition(s) failed so a
-                # future "no-trade" diagnosis is one log line away.
-                failed = [name for name, ok in conds.items() if not ok]
-                if not conds["stoch_xover"]:
-                    n_stoch_fail += 1
-                if not conds["macd_rising"]:
-                    n_macd_fail += 1
-                if not conds["volume_spike"]:
-                    n_vol_spike_fail += 1
-                logger.debug(
-                    f"{asset} | drop={drop_pct:+.2f}% | vol={vol_val:.0f} | "
-                    f"stoch_k={stoch_k:.1f} | stoch_d={stoch_d:.1f} | "
-                    f"macd_hist={macd_hist:+.4f} | "
-                    f"conds={conds} | verdict=FAIL {','.join(failed)}"
+                    f"{asset} | verdict=FAIL insufficient_data "
+                    f"(bars={len(df)} < {min_bars_needed})"
                 )
                 continue
 
-            logger.debug(
-                f"{asset} | drop={drop_pct:+.2f}% | vol={vol_val:.0f} | "
-                f"stoch_k={stoch_k:.1f} | stoch_d={stoch_d:.1f} | "
-                f"macd_hist={macd_hist:+.4f} | conds={conds} | verdict=PASS"
+            # Compute indicators so df has stoch_rsi_k/d, macd_hist. The new
+            # helpers read stoch_k/stoch_d, so alias them after compute_stoch_rsi.
+            df = compute_stoch_rsi(
+                df,
+                length=SPOT["stoch_rsi_length"],
+                k_smooth=SPOT["stoch_rsi_k_smooth"],
+                d_smooth=SPOT["stoch_rsi_d_smooth"],
+                oversold=SPOT["stoch_rsi_oversold"],
+            )
+            df["stoch_k"] = df["stoch_rsi_k"]
+            df["stoch_d"] = df["stoch_rsi_d"]
+            df = compute_macd(
+                df,
+                fast=SPOT["macd_fast"],
+                slow=SPOT["macd_slow"],
+                signal=SPOT["macd_signal"],
             )
 
+            # New entry conditions (all on the latest closed candle / windows).
+            drop_pct = compute_drop_pct(df, lookback=SPOT["drop_lookback_candles"])
+            cond_drop = drop_pct <= SPOT["drop_pct"]   # drop_pct is negative
+            cond_green = is_green_candle(df)
+            cond_stoch = is_stoch_golden_cross_now(df, oversold=SPOT["stoch_rsi_oversold"])
+            cond_macd = is_macd_turning_from_negative(df)
+            cond_vol = has_concentrated_volume_burst(
+                df,
+                lookback=SPOT["volume_lookback_candles"],
+                multiplier=SPOT["volume_burst_multiplier"],
+                min_bars=SPOT["volume_burst_min_bars"],
+                max_bars=SPOT["volume_burst_max_bars"],
+            )
+
+            conds = {
+                "drop": cond_drop,
+                "green": cond_green,
+                "stoch_xover": cond_stoch,
+                "macd_turn": cond_macd,
+                "vol_burst": cond_vol,
+            }
+            passed = all(conds.values())
+            if passed:
+                verdict = "PASS"
+            else:
+                failed = [name for name, ok in conds.items() if not ok]
+                verdict = "FAIL " + ",".join(failed)
+                if not cond_drop:
+                    n_drop_window_fail += 1
+                if not cond_green:
+                    n_green_fail += 1
+                if not cond_stoch:
+                    n_stoch_fail += 1
+                if not cond_macd:
+                    n_macd_fail += 1
+                if not cond_vol:
+                    n_vol_burst_fail += 1
+
+            logger.debug(
+                f"{asset} | drop={drop_pct:.2f}% | green={cond_green} | "
+                f"stoch_xover={cond_stoch} | macd_turn={cond_macd} | "
+                f"vol_burst={cond_vol} | verdict={verdict}"
+            )
+
+            if not passed:
+                continue
+
+            latest = df.iloc[-2]   # latest CLOSED candle (never iloc[-1])
+            stoch_k = float(latest["stoch_rsi_k"]) if pd.notna(latest["stoch_rsi_k"]) else float("nan")
             avg_prev = df["volume"].iloc[-5:-2].mean()
             vol_ratio = float(latest["volume"] / avg_prev) if avg_prev > 0 else 0.0
             signal = TradeSignal(
                 asset=asset,
                 price=float(latest["close"]),
                 timestamp_ms=int(latest.name),
-                reason="spot:stoch_xover+macd_rising+vol_spike(windowed)",
+                reason="spot:drop+green+stoch_xover+macd_turn+vol_burst",
                 indicators_snapshot={
                     "stoch_k": float(latest["stoch_rsi_k"]),
                     "stoch_d": float(latest["stoch_rsi_d"]),
@@ -260,7 +302,7 @@ class SpotStrategy(BaseStrategy):
             signals.append(signal)
             logger.info(
                 f"SIGNAL: {asset} | entry=${signal.price:.4f} | "
-                f"stoch_k={stoch_k:.1f} | drop={drop_pct:+.2f}% | vol_ratio={vol_ratio:.2f}x"
+                f"stoch_k={stoch_k:.1f} | drop={drop_pct:.2f}% | vol_ratio={vol_ratio:.2f}x"
             )
             if len(signals) >= 3:
                 break
@@ -268,18 +310,21 @@ class SpotStrategy(BaseStrategy):
         # End-of-scan summary
         logger.info(
             f"Scan complete: {len(capped)} evaluated, {len(signals)} signals | "
-            f"stage2_filters: stoch={n_stoch_fail}, macd={n_macd_fail}, "
-            f"vol_spike={n_vol_spike_fail}, candle_fail={n_candle_fail}, "
-            f"insufficient_data={n_insufficient_data} | "
+            f"stage2_filters: drop={n_drop_window_fail}, green={n_green_fail}, "
+            f"stoch={n_stoch_fail}, macd={n_macd_fail}, vol_burst={n_vol_burst_fail}, "
+            f"candle_fail={n_candle_fail}, insufficient_data={n_insufficient_data} | "
             f"stage1_filters: drop={n_drop_fail}, volume={n_vol_fail}, "
-            f"funding={n_funding_fail}, ctx_invalid={n_ctx_invalid}"
+            f"funding={n_funding_fail}, ctx_invalid={n_ctx_invalid}, "
+            f"already_open={n_already_open}"
         )
 
         if not signals:
             rejections = {
+                "drop_window": n_drop_window_fail,
+                "green": n_green_fail,
                 "stoch_xover": n_stoch_fail,
-                "macd_rising": n_macd_fail,
-                "volume_spike": n_vol_spike_fail,
+                "macd_turn": n_macd_fail,
+                "vol_burst": n_vol_burst_fail,
                 "candle_fetch": n_candle_fail,
                 "insufficient_data": n_insufficient_data,
             }

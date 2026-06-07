@@ -169,6 +169,73 @@ def compute_spot_indicators(df: pd.DataFrame, *,
     return df
 
 
+# ===========================================================================
+# NEW SPOT entry helpers (revamped spec). Pure, unit-testable predicates that
+# operate strictly on CLOSED candles (latest closed == iloc[-2]; iloc[-1] is the
+# in-progress candle and is excluded everywhere).
+# ===========================================================================
+
+
+def compute_drop_pct(df, lookback=72):
+    """% drop from highest high over last `lookback` closed candles to last close.
+    Returns a float (negative if dropped, positive if currently above the window high)."""
+    if len(df) < lookback + 2:
+        return 0.0
+    window = df.iloc[-(lookback + 2):-2]   # exclude live candle
+    high = float(window["high"].max())
+    last_close = float(df["close"].iloc[-2])
+    if high <= 0:
+        return 0.0
+    return (last_close / high - 1) * 100
+
+
+def is_green_candle(df):
+    """True if the last closed candle is bullish (close > open)."""
+    if len(df) < 2:
+        return False
+    last = df.iloc[-2]
+    return float(last["close"]) > float(last["open"])
+
+
+def is_stoch_golden_cross_now(df, oversold=20):
+    """Cross of K above D AT the last closed candle, with both K and D < oversold
+    at that candle. Requires the K/D columns to already be present (from compute_stoch_rsi)."""
+    if len(df) < 3 or "stoch_k" not in df.columns or "stoch_d" not in df.columns:
+        return False
+    k_now, d_now = float(df["stoch_k"].iloc[-2]), float(df["stoch_d"].iloc[-2])
+    k_prev, d_prev = float(df["stoch_k"].iloc[-3]), float(df["stoch_d"].iloc[-3])
+    crossed = k_prev <= d_prev and k_now > d_now
+    in_oversold = k_now < oversold and d_now < oversold
+    return crossed and in_oversold
+
+
+def is_macd_turning_from_negative(df):
+    """Bearish momentum weakening: hist[-2] < 0 AND |hist[-2]| < |hist[-3]|.
+    Requires 'macd_hist' column from compute_macd."""
+    if len(df) < 3 or "macd_hist" not in df.columns:
+        return False
+    h2 = float(df["macd_hist"].iloc[-2])
+    h3 = float(df["macd_hist"].iloc[-3])
+    return h2 < 0 and abs(h2) < abs(h3)
+
+
+def has_concentrated_volume_burst(df, lookback=72, multiplier=1.5, min_bars=1, max_bars=3):
+    """True if exactly 1 to 3 of the last `lookback` closed candles have volume
+    greater than multiplier × mean(volume) over those same `lookback` candles.
+    More than `max_bars` (sustained high-volume) → fails. Zero (no burst) → fails."""
+    if len(df) < lookback + 2:
+        return False
+    window = df.iloc[-(lookback + 2):-2]
+    vols = window["volume"].astype(float)
+    if len(vols) == 0:
+        return False
+    mean_vol = vols.mean()
+    if mean_vol <= 0:
+        return False
+    high_count = int((vols > multiplier * mean_vol).sum())
+    return min_bars <= high_count <= max_bars
+
+
 def evaluate_spot_conditions(
     df: pd.DataFrame,
     drop_pct: float,
@@ -197,7 +264,11 @@ def evaluate_spot_conditions(
     if stoch_cross_lookback is None:
         stoch_cross_lookback = config.SPOT["stoch_cross_lookback"]
     if macd_hist_rising_bars is None:
-        macd_hist_rising_bars = config.SPOT["macd_hist_rising_bars"]
+        # SPOT["macd_hist_rising_bars"] was removed (replaced by macd_turning in
+        # the new spot path); fall back to the top-level legacy constant.
+        macd_hist_rising_bars = config.SPOT.get(
+            "macd_hist_rising_bars", config.MACD_HIST_RISING_BARS
+        )
     if volume_spike_window is None:
         volume_spike_window = config.SPOT["volume_spike_window"]
 
