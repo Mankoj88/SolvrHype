@@ -27,6 +27,7 @@ from config import (
     MAX_OPEN_POSITIONS, MIN_POSITION_SIZE_USD, MAX_POSITION_SIZE_USD,
     LEVERAGE, USE_ISOLATED_MARGIN, SLIPPAGE_TOLERANCE, DRY_RUN, DATA_DIR,
     COOLDOWN_AFTER_CLOSE_MINUTES,
+    INITIAL_CAPITAL_USD,
     SPOT, DERIVATIVE,
     PSAR_STEP, PSAR_MAX_STEP, PSAR_HOLD_MAX_HOURS,
 )
@@ -759,7 +760,7 @@ class OrderManager:
             "trade_close", asset, size_usd,
             pnl_usd=pnl_usd, notes=f"reason={exit_reason}",
         )
-        HealthMonitor().on_trade_close(pnl_usd, size_usd)
+        HealthMonitor().on_trade_close(pnl_usd, INITIAL_CAPITAL_USD)
         if pnl_usd > 0:
             WithdrawManager().record_profit(pnl_usd)
 
