@@ -5,7 +5,7 @@ ARCHITECTURE (rate-limit safe):
   Stage 1 — ctx-only pre-filter (0 API call per asset):
     funding window + dayNtlVlm + drop = markPx/prevDayPx-1
   Stage 2 — top-N survivors only:
-    sort by drop_pct ASC → cap at MAX_CANDIDATES_PER_CYCLE
+    sort by day_vol DESC → cap at MAX_CANDIDATES_PER_CYCLE
     fetch 5m candles → indicators → signals
 
 Sebelum refactor, pipeline lama melakukan ~365 API calls/cycle dan kena HTTP 429.
@@ -150,9 +150,6 @@ class SpotStrategy(BaseStrategy):
             if not self._passes_volume(asset, ctx):
                 n_vol_fail += 1
                 continue
-            if drop_pct > -SPOT["min_daily_drop_pct"]:
-                n_drop_fail += 1
-                continue
             candidates.append((asset, ctx, mark, day_vol, drop_pct))
 
         if not candidates:
@@ -163,8 +160,10 @@ class SpotStrategy(BaseStrategy):
             )
             return []
 
-        # Sort: paling drop dulu (kondisi oversold paling kuat)
-        candidates.sort(key=lambda t: t[4])
+        # Sort by day_vol DESC: prioritize the most liquid assets for Stage 2 evaluation.
+        # The dayDrop pre-filter was removed — Stage 2 compute_drop_pct(df, 72) is the
+        # authoritative drop check now (6h timeframe, consistent with the strategy spec).
+        candidates.sort(key=lambda t: t[3], reverse=True)
         capped = candidates[:MAX_CANDIDATES_PER_CYCLE]
         logger.info(
             f"Spot scan: {len(candidates)} ctx-filter survivors, "

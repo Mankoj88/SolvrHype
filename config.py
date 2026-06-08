@@ -118,7 +118,7 @@ SPOT = {
     "volume_lookback_candles": 72,
     "volume_burst_multiplier": 1.5,
     "volume_burst_min_bars": 1,
-    "volume_burst_max_bars": 3,
+    "volume_burst_max_bars": 10,
     "cutloss_pct": -2.0,
     # (tp_pct, sell_fraction_of_remaining, post_action)
     "take_profits": [(2.0, 0.50, "breakeven"), (5.0, 1.00, None)],
@@ -137,7 +137,7 @@ DERIVATIVE = {
     "funding_rate_positive_threshold": 0.0002,   # +0.02% → short setup
     "support_resistance_lookback_candles": 96,   # ~8 jam
     "support_resistance_pivot_window": 5,
-    "support_proximity_pct": 0.01,          # ±1% dari S/R level
+    "support_proximity_pct": 0.025,         # ±2.5% dari S/R level
     "swing_lookback_candles": 20,
     "swing_pivot_window": 5,
     "structure_break_buffer_pct": 0.005,    # 0.5% buffer
