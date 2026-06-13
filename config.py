@@ -140,6 +140,7 @@ DERIVATIVE = {
     "support_proximity_pct": 0.025,         # ±2.5% dari S/R level
     "swing_lookback_candles": 20,
     "swing_pivot_window": 5,
+    "min_sl_distance_pct": 1.5,             # min SL distance floor (% from entry) to avoid SL≈entry bug
     "structure_break_buffer_pct": 0.005,    # 0.5% buffer
     "risk_per_trade_pct": 1.5,              # % dari TOTAL equity
     "max_leverage": 5,

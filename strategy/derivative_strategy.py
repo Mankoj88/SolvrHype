@@ -95,6 +95,32 @@ class DerivativeStrategy(BaseStrategy):
         raw = risk_pct / sl_distance_pct
         return max(1, min(DERIVATIVE["max_leverage"], math.floor(raw)))
 
+    def _apply_min_sl_distance(self, entry_price: float, swing: float, is_long: bool) -> float:
+        """
+        Floor SL distance to DERIVATIVE['min_sl_distance_pct'].
+        For long: SL = max(swing, entry × (1 - min_pct/100))  → wider/safer wins
+        For short: SL = min(swing, entry × (1 + min_pct/100)) → wider/safer wins
+        Logs when override fires for transparency.
+        """
+        min_pct = DERIVATIVE.get("min_sl_distance_pct", 1.5)
+        floor_distance = entry_price * (min_pct / 100)
+
+        if is_long:
+            min_safe_sl = entry_price - floor_distance   # max allowed SL price (further below)
+            final_sl = min(swing, min_safe_sl)            # use the LOWER (wider) of the two
+        else:
+            min_safe_sl = entry_price + floor_distance   # min allowed SL price (further above)
+            final_sl = max(swing, min_safe_sl)            # use the HIGHER (wider) of the two
+
+        if final_sl != swing:
+            actual_distance_pct = abs(entry_price - final_sl) / entry_price * 100
+            swing_distance_pct = abs(entry_price - swing) / entry_price * 100
+            logger.info(
+                f"SL floor applied: swing@{swing:.6f} ({swing_distance_pct:.2f}%) too close, "
+                f"using floor@{final_sl:.6f} ({actual_distance_pct:.2f}%) [min={min_pct}%]"
+            )
+        return final_sl
+
     def _at_level(self, price: float, level: float) -> bool:
         if level <= 0:
             return False
@@ -222,7 +248,8 @@ class DerivativeStrategy(BaseStrategy):
         if swing <= 0 or swing >= current_price:
             return None  # invalid SL
 
-        leverage = self._compute_safe_leverage(current_price, swing)
+        sl_price = self._apply_min_sl_distance(current_price, swing, is_long=True)
+        leverage = self._compute_safe_leverage(current_price, sl_price)
         distance_to_level = abs(current_price - sr["support"]) / current_price * 100
 
         return TradeSignal(
@@ -240,14 +267,14 @@ class DerivativeStrategy(BaseStrategy):
                 "resistance": sr["resistance"],
                 "sideways_top": sr["sideways_top"],
                 "sideways_bottom": sr["sideways_bottom"],
-                "swing_low": swing,
+                "swing_low": sl_price,
                 "liquidation_proxy": liquidation_proxy(oi_change, funding, distance_to_level),
                 "timeframe": DERIVATIVE["timeframe"],
             },
             strategy_type="derivative",
             leverage=leverage,
             is_long=True,
-            suggested_sl_price=swing,
+            suggested_sl_price=sl_price,
             sl_mode="swing_low",
         )
 
@@ -266,7 +293,8 @@ class DerivativeStrategy(BaseStrategy):
         if swing <= 0 or swing <= current_price:
             return None  # invalid SL
 
-        leverage = self._compute_safe_leverage(current_price, swing)
+        sl_price = self._apply_min_sl_distance(current_price, swing, is_long=False)
+        leverage = self._compute_safe_leverage(current_price, sl_price)
         distance_to_level = abs(current_price - sr["resistance"]) / current_price * 100
 
         return TradeSignal(
@@ -284,13 +312,13 @@ class DerivativeStrategy(BaseStrategy):
                 "resistance": sr["resistance"],
                 "sideways_top": sr["sideways_top"],
                 "sideways_bottom": sr["sideways_bottom"],
-                "swing_high": swing,
+                "swing_high": sl_price,
                 "liquidation_proxy": liquidation_proxy(oi_change, funding, distance_to_level),
                 "timeframe": DERIVATIVE["timeframe"],
             },
             strategy_type="derivative",
             leverage=leverage,
             is_long=False,
-            suggested_sl_price=swing,
+            suggested_sl_price=sl_price,
             sl_mode="swing_high",
         )
