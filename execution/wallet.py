@@ -69,6 +69,55 @@ class WalletReader:
 
     # ---------------------------------------------------------------- read
 
+    def _log_diagnostic(self, perp_state: dict, spot_state: dict, bal: 'WalletBalance') -> None:
+        """Dump raw API state + computed balance for equity reconciliation.
+        Logged at INFO level with tag [EQUITY_DIAG] so it's grep-friendly."""
+        try:
+            ms = perp_state.get("marginSummary", {}) if perp_state else {}
+            asset_positions = perp_state.get("assetPositions", []) if perp_state else []
+            withdrawable = perp_state.get("withdrawable", 0) if perp_state else 0
+            spot_balances = spot_state.get("balances", []) if spot_state else []
+
+            # Per-position summary (no truncation)
+            pos_summary = []
+            for p in asset_positions:
+                pos = p.get("position", {})
+                pos_summary.append({
+                    "coin": pos.get("coin"),
+                    "szi": pos.get("szi"),
+                    "entryPx": pos.get("entryPx"),
+                    "positionValue": pos.get("positionValue"),
+                    "unrealizedPnl": pos.get("unrealizedPnl"),
+                    "marginUsed": pos.get("marginUsed"),
+                })
+
+            # All spot balances (USDC + tokens)
+            spot_summary = []
+            for b in spot_balances:
+                total = float(b.get("total", 0) or 0)
+                if total > 0:
+                    spot_summary.append({
+                        "coin": b.get("coin"),
+                        "total": total,
+                        "hold": float(b.get("hold", 0) or 0),
+                        "entryNtl": b.get("entryNtl"),
+                    })
+
+            logger.info(
+                f"[EQUITY_DIAG] perp_accountValue={ms.get('accountValue', 'N/A')} "
+                f"perp_totalMarginUsed={ms.get('totalMarginUsed', 'N/A')} "
+                f"perp_totalNtlPos={ms.get('totalNtlPos', 'N/A')} "
+                f"perp_totalRawUsd={ms.get('totalRawUsd', 'N/A')} "
+                f"perp_withdrawable={withdrawable} "
+                f"open_positions={len(asset_positions)} "
+                f"positions={pos_summary} "
+                f"spot_balances={spot_summary} "
+                f"computed_total_equity={bal.total_equity} "
+                f"computed_spot_usdc={bal.spot_usdc}"
+            )
+        except Exception as e:
+            logger.warning(f"[EQUITY_DIAG] failed: {e}")
+
     def get_unified_balance(self, force_refresh: bool = False) -> WalletBalance:
         now = time.time()
         if (not force_refresh
@@ -82,6 +131,7 @@ class WalletReader:
         # posisi). Spot USDC dipakai otomatis sebagai margin, jadi harus
         # ditambahkan untuk dapat total tradeable equity yang sebenarnya.
         perp_equity_raw = 0.0
+        perp_state = None
         try:
             perp_state = self._info.user_state(self._account)
             ms = perp_state.get("marginSummary", {}) if perp_state else {}
@@ -91,6 +141,7 @@ class WalletReader:
             logger.warning(f"Wallet: perp user_state fetch failed: {e}")
 
         spot_usdc = 0.0
+        spot_state = None
         try:
             spot_state = self._info.spot_user_state(self._account)
             for b in (spot_state or {}).get("balances", []) or []:
@@ -110,6 +161,7 @@ class WalletReader:
             f"total={bal.total_equity:.2f}"
         )
 
+        self._log_diagnostic(perp_state, spot_state, bal)
         self._cache = bal
         return bal
 
