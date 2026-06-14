@@ -24,7 +24,7 @@ from config import (
 )
 from strategy.base_strategy import BaseStrategy, TradeSignal
 from strategy.indicators import (
-    compute_stoch_rsi, compute_macd,
+    compute_stoch_rsi, compute_macd, compute_ema,
     compute_drop_pct, is_green_candle, is_stoch_golden_cross_now,
     is_macd_turning_from_negative, has_concentrated_volume_burst,
 )
@@ -176,7 +176,8 @@ class SpotStrategy(BaseStrategy):
         # hold on the latest CLOSED candle (iloc[-2]).
         n_candle_fail = 0
         n_insufficient_data = 0
-        n_drop_window_fail = 0
+        n_ema60_fail = 0
+        n_ema_cross_fail = 0
         n_green_fail = 0
         n_stoch_fail = 0
         n_macd_fail = 0
@@ -222,10 +223,19 @@ class SpotStrategy(BaseStrategy):
                 slow=SPOT["macd_slow"],
                 signal=SPOT["macd_signal"],
             )
+            df = compute_ema(
+                df,
+                fast=SPOT["ema_fast_period"],
+                slow=SPOT["ema_slow_period"],
+            )
 
             # New entry conditions (all on the latest closed candle / windows).
             drop_pct = compute_drop_pct(df, lookback=SPOT["drop_lookback_candles"])
-            cond_drop = drop_pct <= SPOT["drop_pct"]   # drop_pct is negative
+            close_last = float(df["close"].iloc[-2])
+            ema_fast_last = float(df["ema_fast"].iloc[-2])
+            ema_slow_last = float(df["ema_slow"].iloc[-2])
+            cond_below_ema = close_last < ema_slow_last
+            cond_ema_cross = ema_fast_last < ema_slow_last
             cond_green = is_green_candle(df)
             cond_stoch = is_stoch_golden_cross_now(df, oversold=SPOT["stoch_rsi_oversold"])
             cond_macd = is_macd_turning_from_negative(df)
@@ -238,7 +248,8 @@ class SpotStrategy(BaseStrategy):
             )
 
             conds = {
-                "drop": cond_drop,
+                "below_ema60": cond_below_ema,
+                "ema_fast_below_slow": cond_ema_cross,
                 "green": cond_green,
                 "stoch_xover": cond_stoch,
                 "macd_turn": cond_macd,
@@ -250,8 +261,10 @@ class SpotStrategy(BaseStrategy):
             else:
                 failed = [name for name, ok in conds.items() if not ok]
                 verdict = "FAIL " + ",".join(failed)
-                if not cond_drop:
-                    n_drop_window_fail += 1
+                if not cond_below_ema:
+                    n_ema60_fail += 1
+                if not cond_ema_cross:
+                    n_ema_cross_fail += 1
                 if not cond_green:
                     n_green_fail += 1
                 if not cond_stoch:
@@ -262,7 +275,9 @@ class SpotStrategy(BaseStrategy):
                     n_vol_burst_fail += 1
 
             logger.debug(
-                f"{asset} | drop={drop_pct:.2f}% | green={cond_green} | "
+                f"{asset} | close={close_last:.6f} | ema10={ema_fast_last:.6f} | "
+                f"ema60={ema_slow_last:.6f} | below_ema60={cond_below_ema} | "
+                f"ema10<60={cond_ema_cross} | green={cond_green} | "
                 f"stoch_xover={cond_stoch} | macd_turn={cond_macd} | "
                 f"vol_burst={cond_vol} | verdict={verdict}"
             )
@@ -278,11 +293,13 @@ class SpotStrategy(BaseStrategy):
                 asset=asset,
                 price=float(latest["close"]),
                 timestamp_ms=int(latest.name),
-                reason="spot:drop+green+stoch_xover+macd_turn+vol_burst",
+                reason="spot:below_ema60+ema_cross+green+stoch_xover+macd_turn+vol_burst",
                 indicators_snapshot={
                     "stoch_k": float(latest["stoch_rsi_k"]),
                     "stoch_d": float(latest["stoch_rsi_d"]),
                     "macd_hist": float(latest["macd_hist"]),
+                    "ema_fast": ema_fast_last,
+                    "ema_slow": ema_slow_last,
                     "volume_ratio": vol_ratio,
                     "drop_pct": drop_pct,
                     "day_ntl_vlm": day_vol,
@@ -309,9 +326,10 @@ class SpotStrategy(BaseStrategy):
         # End-of-scan summary
         logger.info(
             f"Scan complete: {len(capped)} evaluated, {len(signals)} signals | "
-            f"stage2_filters: drop={n_drop_window_fail}, green={n_green_fail}, "
-            f"stoch={n_stoch_fail}, macd={n_macd_fail}, vol_burst={n_vol_burst_fail}, "
-            f"candle_fail={n_candle_fail}, insufficient_data={n_insufficient_data} | "
+            f"stage2_filters: below_ema60={n_ema60_fail}, ema_cross={n_ema_cross_fail}, "
+            f"green={n_green_fail}, stoch={n_stoch_fail}, macd={n_macd_fail}, "
+            f"vol_burst={n_vol_burst_fail}, candle_fail={n_candle_fail}, "
+            f"insufficient_data={n_insufficient_data} | "
             f"stage1_filters: drop={n_drop_fail}, volume={n_vol_fail}, "
             f"funding={n_funding_fail}, ctx_invalid={n_ctx_invalid}, "
             f"already_open={n_already_open}"
@@ -319,7 +337,8 @@ class SpotStrategy(BaseStrategy):
 
         if not signals:
             rejections = {
-                "drop_window": n_drop_window_fail,
+                "below_ema60": n_ema60_fail,
+                "ema_cross": n_ema_cross_fail,
                 "green": n_green_fail,
                 "stoch_xover": n_stoch_fail,
                 "macd_turn": n_macd_fail,

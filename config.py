@@ -97,7 +97,7 @@ SPOT = {
     # checks always see valid data: max(VOLUME_SPIKE_WINDOW=48, 60)=60 + ~MACD
     # (30+10) / stoch (10+5+5) warmup ~= 100 bars. 120 closed 5m bars (~10h)
     # clears that with ~20 bars margin.
-    "candle_lookback": 120,
+    "candle_lookback": 240,                # EMA60 needs ~4x period to converge
     "min_7d_avg_daily_volume_usd": 100_000,   # legacy key (deriv/other paths)
     "scan_min_24h_volume_usd": SCAN_MIN_24H_VOLUME_USD,  # spot gate per spec
     "min_daily_drop_pct": 2.0,            # stage-1 ctx 24h pre-filter (markPx/prevDayPx)
@@ -108,7 +108,9 @@ SPOT = {
     "stoch_rsi_k_smooth": 5,
     "stoch_rsi_d_smooth": 5,
     "stoch_rsi_oversold": 20,
-    "stoch_cross_lookback": 1,           # cross must occur at the last closed candle only
+    "stoch_cross_lookback": 2,           # golden cross may occur within last 2 closed candles
+    "ema_fast_period": 10,
+    "ema_slow_period": 60,
     "macd_fast": 10, "macd_slow": 30, "macd_signal": 10,
     "macd_turning_negative": True,       # hist[-2] negative & |hist[-2]| < |hist[-3]|
     "vol_spike_lookback": 3,              # legacy key (unused by spot windowed path)

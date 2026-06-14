@@ -32,10 +32,20 @@ def _windowed_setup_df() -> pd.DataFrame:
     logic (the actual bug), not `ta`'s internal math. Row layout (iloc):
       -1  : in-progress candle (must be ignored by entry detection)
       -2  : latest CLOSED candle == entry candle
-      -4  : Stoch-RSI golden cross (2 candles before the entry candle)
+      -3  : Stoch-RSI golden cross (1 candle before entry, inside the
+            stoch_cross_lookback=2 window iloc[-3:-1] -> still NOT on the entry
+            candle, so the legacy single-candle gate at iloc[-2] still misses it)
       -22 : volume spike (~20 candles before entry, inside the 48-bar window)
     MACD histogram is negative everywhere but strictly rising at the entry
     candle (no zero-cross) -> legacy macd_reversal=False, new rising=True.
+
+    EMA trend gate (new spec): a short-term pullback — the slow EMA (ema_slow,
+    ~EMA60) sits ABOVE price and the fast EMA sits below the slow EMA. On the
+    entry candle this satisfies BOTH new conditions:
+      close[-2] (100) < ema_slow[-2] (103)   -> below_ema60 = True
+      ema_fast[-2] (101) < ema_slow[-2] (103) -> ema_fast_below_slow = True
+    EMA columns are hand-set (like the other indicator columns) so the test
+    targets the gate logic, not `ta`'s EMA math.
     """
     n = 60
     df = pd.DataFrame({
@@ -46,11 +56,12 @@ def _windowed_setup_df() -> pd.DataFrame:
         "volume": np.full(n, 1000.0),
     })
 
-    # Stoch RSI: oversold throughout; golden cross flagged only at iloc[-4].
+    # Stoch RSI: oversold throughout; golden cross flagged only at iloc[-3]
+    # (within the stoch_cross_lookback=2 window, but not on the entry candle).
     df["stoch_rsi_k"] = 10.0
     df["stoch_rsi_d"] = 12.0
     df["stoch_golden_cross"] = False
-    df.iloc[-4, df.columns.get_loc("stoch_golden_cross")] = True
+    df.iloc[-3, df.columns.get_loc("stoch_golden_cross")] = True
 
     # MACD histogram: all negative, strictly rising toward (never crossing) 0.
     hist = np.linspace(-5.0, -1.0, n)   # monotonically increasing, stays < 0
@@ -64,6 +75,11 @@ def _windowed_setup_df() -> pd.DataFrame:
     df["volume_spike"] = False
     df.iloc[-22, df.columns.get_loc("volume_spike")] = True
     df.iloc[-22, df.columns.get_loc("volume")] = 5000.0
+
+    # EMA trend gate: pullback context (price under an elevated slow EMA; fast
+    # EMA under slow EMA) -> below_ema60 and ema_fast_below_slow both True.
+    df["ema_slow"] = 103.0
+    df["ema_fast"] = 101.0
     return df
 
 
@@ -95,16 +111,25 @@ def test_windowed_entry_signal_fires():
     assert is_spot_entry_signal(df, drop_pct=-3.0) is True
 
 
-def test_windowed_signal_requires_all_four():
-    """AND-logic guard: drop_pct failing condition 1 must veto the signal."""
+def test_windowed_signal_requires_all_conditions():
+    """AND-logic guard: a single failing condition must veto the signal.
+
+    The old 24h-drop condition was replaced by the EMA trend gate, so drop_pct
+    no longer vetoes. Demonstrate the AND-gate via a failing EMA condition:
+    price ABOVE the slow EMA -> below_ema60 = False -> entry vetoed even though
+    every other condition (ema cross, green, stoch, macd, volume) still holds.
+    """
     try:
         from strategy.indicators import is_spot_entry_signal
     except ImportError:
         pytest.fail("is_spot_entry_signal() not implemented yet")
 
     df = _windowed_setup_df()
-    # drop_pct above the threshold (i.e. not a real dip) -> no entry.
-    assert is_spot_entry_signal(df, drop_pct=+1.0) is False
+    # Slow EMA below price -> below_ema60 fails; ema_fast (94) < ema_slow (95)
+    # stays True so exactly one condition is the cause of the veto.
+    df["ema_slow"] = 95.0
+    df["ema_fast"] = 94.0
+    assert is_spot_entry_signal(df, drop_pct=-3.0) is False
 
 
 # ---------------------------------------------------------------------------

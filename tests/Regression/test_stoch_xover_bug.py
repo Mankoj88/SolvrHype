@@ -50,6 +50,12 @@ def _pengu_df() -> pd.DataFrame:
     for i in (-3, -2, -1):
         df.iloc[i, k_loc] = 20.0
         df.iloc[i, d_loc] = 9.8
+
+    # EMA trend gate (new spec): set to PASSING (pullback) so the EMA conditions
+    # don't interfere — this test isolates the stoch golden-cross detection.
+    # close (100) < ema_slow (103) and ema_fast (101) < ema_slow (103).
+    df["ema_slow"] = 103.0
+    df["ema_fast"] = 101.0
     return df
 
 

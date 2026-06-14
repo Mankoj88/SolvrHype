@@ -149,16 +149,25 @@ def compute_volume_spike_sma(df: pd.DataFrame, period: int = 20,
     return df
 
 
+def compute_ema(df: pd.DataFrame, fast: int = 10, slow: int = 60) -> pd.DataFrame:
+    """Standard EMA fast & slow on close. Adds 'ema_fast' and 'ema_slow' columns."""
+    from ta.trend import EMAIndicator
+    df["ema_fast"] = EMAIndicator(close=df["close"], window=fast, fillna=False).ema_indicator()
+    df["ema_slow"] = EMAIndicator(close=df["close"], window=slow, fillna=False).ema_indicator()
+    return df
+
+
 def compute_spot_indicators(df: pd.DataFrame, *,
                             stoch_length: int, stoch_k: int, stoch_d: int,
                             stoch_oversold: float,
                             macd_fast: int, macd_slow: int, macd_signal: int,
                             volume_sma_period: int,
-                            volume_spike_multiplier: float) -> pd.DataFrame:
+                            volume_spike_multiplier: float,
+                            ema_fast: int = 10, ema_slow: int = 60) -> pd.DataFrame:
     """SPOT indicator pipeline. Returns a NEW DataFrame with all spot columns.
 
     Adds: stoch_rsi_k/d, stoch_golden_cross, macd/_signal/_hist, macd_reversal
-    (diagnostic), macd_hist_rising, volume_sma, volume_spike.
+    (diagnostic), macd_hist_rising, volume_sma, volume_spike, ema_fast, ema_slow.
     """
     df = df.copy()
     df = compute_stoch_rsi(df, length=stoch_length, k_smooth=stoch_k,
@@ -166,6 +175,7 @@ def compute_spot_indicators(df: pd.DataFrame, *,
     df = compute_macd(df, fast=macd_fast, slow=macd_slow, signal=macd_signal)
     df = compute_volume_spike_sma(df, period=volume_sma_period,
                                   multiplier=volume_spike_multiplier)
+    df = compute_ema(df, fast=ema_fast, slow=ema_slow)
     return df
 
 
@@ -272,8 +282,8 @@ def evaluate_spot_conditions(
     if volume_spike_window is None:
         volume_spike_window = config.SPOT["volume_spike_window"]
 
-    result = {"drop": False, "stoch_xover": False,
-              "macd_rising": False, "volume_spike": False}
+    result = {"below_ema60": False, "ema_fast_below_slow": False,
+              "stoch_xover": False, "macd_rising": False, "volume_spike": False}
 
     # Closed-candle contract: latest closed == iloc[-2]; the in-progress candle
     # iloc[-1] is EXCLUDED from every window via the `:-1` upper bound. We slice
@@ -282,8 +292,15 @@ def evaluate_spot_conditions(
     if len(df) < 3:
         return result
 
-    # Condition 1 — 24h drop.
-    result["drop"] = drop_pct <= -min_drop_pct
+    # Condition 1 — EMA trend: price below EMA60 AND fast EMA below slow EMA, on
+    # the latest CLOSED candle (iloc[-2]). Replaces the old 24h-drop gate.
+    if "ema_slow" in df.columns and "ema_fast" in df.columns:
+        close_last = df["close"].values[-2]
+        ema_fast_last = df["ema_fast"].values[-2]
+        ema_slow_last = df["ema_slow"].values[-2]
+        if not (np.isnan(ema_slow_last) or np.isnan(ema_fast_last)):
+            result["below_ema60"] = bool(close_last < ema_slow_last)
+            result["ema_fast_below_slow"] = bool(ema_fast_last < ema_slow_last)
 
     cols = df.columns
 
