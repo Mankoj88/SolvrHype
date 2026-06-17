@@ -25,7 +25,7 @@ from config import (
 from strategy.base_strategy import BaseStrategy, TradeSignal
 from strategy.indicators import (
     compute_stoch_rsi, compute_macd, compute_ema,
-    compute_drop_pct, is_green_candle, is_stoch_golden_cross_now,
+    compute_drop_pct, is_green_candle,
     is_macd_turning_from_negative, has_concentrated_volume_burst,
 )
 from strategy.universe import UniverseFetcher
@@ -237,7 +237,19 @@ class SpotStrategy(BaseStrategy):
             cond_below_ema = close_last < ema_slow_last
             cond_ema_cross = ema_fast_last < ema_slow_last
             cond_green = is_green_candle(df)
-            cond_stoch = is_stoch_golden_cross_now(df, oversold=SPOT["stoch_rsi_oversold"])
+            # Stoch-RSI golden cross within the last `stoch_cross_lookback` (=2)
+            # CLOSED candles, not just the single last-closed bar. Reuse the SAME
+            # `stoch_golden_cross` column + windowed .any() as the pure
+            # evaluate_spot_conditions() helper so inline and helper agree. The
+            # oversold constraint (config oversold=20) is already baked into the
+            # column by compute_stoch_golden_cross().
+            # INDEXING: the live (unclosed) candle is index -1 and is EXCLUDED by
+            # the `:-1` upper bound. For lb=2 the window is values[-3:-1] = the
+            # last two CLOSED candles (-3, -2); the cross may occur at the
+            # last-closed bar (-2) or the one before it (-3).
+            lb = SPOT["stoch_cross_lookback"]
+            gc_window = df["stoch_golden_cross"].values[-(lb + 1):-1]
+            cond_stoch = bool(gc_window.any())
             cond_macd = is_macd_turning_from_negative(df)
             cond_vol = has_concentrated_volume_burst(
                 df,

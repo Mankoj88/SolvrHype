@@ -36,7 +36,7 @@ import pytest
 
 from config import SPOT
 from strategy.indicators import (
-    is_green_candle, is_stoch_golden_cross_now, is_macd_turning_from_negative,
+    is_green_candle, is_macd_turning_from_negative,
     has_concentrated_volume_burst, is_spot_entry_signal,
 )
 
@@ -49,11 +49,10 @@ pytestmark = [pytest.mark.regression]
 # ---------------------------------------------------------------------------
 KNOWN_DIFFERENCES = {
     "green": "Inline ANDs is_green_candle(); the helper has NO green key at all.",
-    "stoch_xover": (
-        "Inline = is_stoch_golden_cross_now(): on-the-fly cross AT iloc[-2] only. "
-        "Helper = windowed .any() over the precomputed stoch_golden_cross column "
-        "across the last stoch_cross_lookback(=2) closed candles (iloc[-3:-1])."
-    ),
+    # RECONCILED: inline scan() now windows the stoch golden cross over the last
+    # stoch_cross_lookback(=2) closed candles using the SAME stoch_golden_cross
+    # column as the helper, so stoch_xover NO LONGER diverges. See
+    # test_stoch_windowed_now_agrees() for the pinned agreement.
     "macd": (
         "Inline = is_macd_turning_from_negative(): hist[-2] < 0 AND "
         "|hist[-2]| < |hist[-3]| (must still be negative). "
@@ -87,7 +86,12 @@ def inline_gate_decision(df: pd.DataFrame) -> bool:
     cond_below_ema = close_last < ema_slow_last
     cond_ema_cross = ema_fast_last < ema_slow_last
     cond_green = is_green_candle(df)
-    cond_stoch = is_stoch_golden_cross_now(df, oversold=SPOT["stoch_rsi_oversold"])
+    # Windowed stoch golden cross over the last stoch_cross_lookback(=2) CLOSED
+    # candles, reading the precomputed stoch_golden_cross column (verbatim with
+    # scan()). Live candle (-1) excluded by the `:-1` upper bound; for lb=2 the
+    # window is values[-3:-1] = closed candles (-3, -2).
+    lb = SPOT["stoch_cross_lookback"]
+    cond_stoch = bool(df["stoch_golden_cross"].values[-(lb + 1):-1].any())
     cond_macd = is_macd_turning_from_negative(df)
     cond_vol = has_concentrated_volume_burst(
         df,
@@ -208,18 +212,26 @@ def test_known_diff_green_only():
     )
 
 
-def test_known_diff_stoch_windowed_vs_at_entry():
-    """Stoch cross 1 candle BEFORE entry: in the helper's window, not at inline's -2."""
+def test_stoch_windowed_now_agrees():
+    """Stoch cross 1 candle BEFORE entry (at iloc[-3]): now in BOTH gates' windows.
+
+    RECONCILED behaviour — the inline gate previously detected the cross only AT
+    iloc[-2] and returned False here; it now windows over the last
+    stoch_cross_lookback(=2) closed candles (iloc[-3:-1]) using the same
+    stoch_golden_cross column as the helper, so both gates AGREE -> True.
+    """
     df = _valid_setup_df()
     # No on-the-fly cross at iloc[-2] (keep k below d everywhere)...
     df["stoch_k"] = 10.0; df["stoch_d"] = 12.0
     # ...but the precomputed column flags the cross at iloc[-3] (inside the
-    # helper's stoch_cross_lookback=2 window iloc[-3:-1]).
+    # stoch_cross_lookback=2 window iloc[-3:-1] that BOTH gates now scan).
     df["stoch_golden_cross"] = False
     df.iloc[-3, df.columns.get_loc("stoch_golden_cross")] = True
-    assert inline_gate_decision(df) is False, "inline only sees a cross AT iloc[-2]"
+    assert inline_gate_decision(df) is True, (
+        "inline now windows the cross over the last 2 closed candles (RECONCILED)"
+    )
     assert helper_gate_decision(df) is True, (
-        "helper windows the cross over the last 2 closed candles (KNOWN DIFFERENCE)"
+        "helper windows the cross over the last 2 closed candles"
     )
 
 
