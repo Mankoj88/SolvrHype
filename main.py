@@ -66,7 +66,9 @@ class Solvira:
         # two concurrent async loops.
         self.state_lock = asyncio.Lock()
         # Pass info so spot sizing can resolve the exchange-min order notional.
-        self.allocation_manager = AllocationManager(self.info)
+        # Pass order_manager so pool usage is DERIVED from live open positions
+        # (no separate reservation state to leak — see AllocationManager.pool_used).
+        self.allocation_manager = AllocationManager(self.info, self.order_manager)
         self.withdraw_manager = WithdrawManager()
         self.wallet = WalletReader(
             info=self.info, exchange=self.order_manager.exchange,
@@ -76,9 +78,9 @@ class Solvira:
         self.stop_loss_enforcer = StopLossEnforcer(initial_capital=INITIAL_CAPITAL_USD)
         self._schedule_stop = threading.Event()  # Bug #13
 
-        # Sync existing positions ke allocation manager (per strategy_type)
-        for asset, pos in self.order_manager.positions.items():
-            self.allocation_manager.reserve(asset, pos.entry_size_usd, pos.strategy_type)
+        # No reservation sync needed: allocation_manager.pool_used derives pool
+        # usage directly from order_manager.positions (loaded + reconciled in
+        # OrderManager.__init__), so existing positions are accounted for live.
 
     def get_total_capital(self) -> float:
         """Total tradeable equity dari marginSummary.accountValue.
@@ -178,7 +180,9 @@ class Solvira:
                             continue
                         success = self.order_manager.execute_entry(signal, size_usd)
                         if success:
-                            self.allocation_manager.reserve(signal.asset, size_usd, signal.strategy_type)
+                            # No reserve() call: the new position is now in
+                            # order_manager.positions, so pool_used picks it up
+                            # on the next calculate_position_size automatically.
                             self.health.open_positions_count += 1
                             self.health.last_signal_time = time.time()
 
