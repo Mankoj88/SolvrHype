@@ -132,10 +132,65 @@ class OrderManager:
             json.dump(data, f, indent=2)
         tmp_path.replace(self.STATE_FILE)
 
-    def _reconcile_with_exchange(self):
-        """Two-way reconciliation: drop stale local, import exchange-only positions."""
+    def _live_sl_orders(self) -> Optional[dict[str, int]]:
+        """Map asset → oid of a LIVE resting reduce-only trigger (stop-loss) order
+        on the exchange, queried via frontend_open_orders (the basic open_orders
+        endpoint does NOT carry reduceOnly/isTrigger, so it can't identify an SL).
+
+        Reconcile uses this to ADOPT an already-live hard SL instead of blanking +
+        re-placing it (which left a window with no hard SL). The bot only ever
+        rests a single reduce-only trigger (the SL) per position, so a reduce-only
+        trigger order on an asset IS that asset's live SL.
+
+        Returns:
+          dict{asset: oid}  on a successful query (possibly empty → no live SLs).
+          None              if no info client or the query failed — the caller then
+                            SKIPS the SL sync this cycle (keeps existing sl_oid +
+                            the soft SL) rather than risk a duplicate placement.
+        """
+        info = getattr(self, "info", None)
+        if info is None:
+            return None
+        try:
+            orders = info.frontend_open_orders(HYPERLIQUID_ACCOUNT)
+        except Exception as e:
+            logger.warning(f"frontend_open_orders query failed during reconcile: {e}")
+            return None
+        live: dict[str, int] = {}
+        try:
+            for o in orders or []:
+                if not o.get("reduceOnly"):
+                    continue
+                if not o.get("isTrigger"):
+                    continue
+                coin, oid = o.get("coin"), o.get("oid")
+                if coin is None or oid is None:
+                    continue
+                # One SL per position — keep the first live trigger seen per asset.
+                live.setdefault(coin, int(oid))
+        except (TypeError, ValueError, AttributeError) as e:
+            logger.warning(f"Could not parse open orders during reconcile: {e}")
+            return None
+        return live
+
+    def _reconcile_with_exchange(self, periodic: bool = False):
+        """Two-way reconciliation between local state and the exchange.
+
+        Runs at startup (periodic=False) and as a periodic safety net (Bug D,
+        periodic=True). Both paths share this logic:
+          * orphan adoption — a position on the exchange but absent from state is
+            imported as spot long with a pct SL,
+          * ghost cleanup — a position in state but NOT on the exchange is removed
+            (NO DB close row: the real exit is unknown; an alert is fired instead),
+          * SL check-before-replace — for each managed position, ADOPT the oid of a
+            live reduce-only trigger (SL) if one already rests on the exchange, and
+            place a fresh SL ONLY when none is live. sl_oid is never blanked first,
+            so a position keeps its existing hard SL untouched (no blank-then-
+            replace gap).
+        """
         if DRY_RUN:
             return
+        tag = "PERIODIC RECONCILE" if periodic else "STARTUP RECONCILE"
         try:
             user_state = self.info.user_state(HYPERLIQUID_ACCOUNT)
             exchange_positions = {
@@ -144,73 +199,45 @@ class OrderManager:
                 if float(p["position"]["szi"]) != 0
             }
 
-            stale_assets = []
+            # --- positions on both sides: sync size only (SL handled below) ---
             for asset, local_pos in list(self.positions.items()):
                 if asset not in exchange_positions:
-                    logger.warning(
-                        f"STALE STATE: {asset} in local but not on exchange. "
-                        f"Likely closed while bot was offline."
-                    )
-                    stale_assets.append(asset)
-                    continue
-
+                    continue  # ghost — handled next
                 exchange_size = abs(exchange_positions[asset])
                 if abs(exchange_size - local_pos.remaining_size_coin) > 0.01 * local_pos.entry_size_coin:
                     logger.warning(
-                        f"SIZE MISMATCH {asset}: local={local_pos.remaining_size_coin:.4f}, "
+                        f"{tag}: SIZE MISMATCH {asset}: local={local_pos.remaining_size_coin:.4f}, "
                         f"exchange={exchange_size:.4f}. Updating local."
                     )
                     local_pos.remaining_size_coin = exchange_size
-                local_pos.sl_oid = None
+                # NOTE (Bug D): do NOT blank sl_oid here — the SL sync step below
+                # adopts the live SL or places one only if missing.
 
-            for asset in stale_assets:
-                pos = self.positions[asset]
-                try:
-                    mids = self.info.all_mids()
-                    exit_price = float(mids.get(asset, pos.entry_price))
-                except Exception:
-                    exit_price = pos.entry_price
-
-                pnl_usd = self._compute_pnl_usd(pos, exit_price, pos.remaining_size_coin)
-                try:
-                    from monitoring.trade_logger import log_trade
-                    from monitoring.tax_logger import log_taxable_event
-                    log_trade(
-                        asset=asset, side=self._close_side(pos),
-                        size_coin=pos.remaining_size_coin,
-                        size_usd=pos.remaining_size_coin * exit_price,
-                        entry_price=pos.entry_price, exit_price=exit_price,
-                        entry_time_ms=pos.entry_time_ms,
-                        exit_time_ms=int(time.time() * 1000),
-                        pnl_usd=pnl_usd,
-                        pnl_pct=self._compute_pnl_pct(pos, exit_price),
-                        exit_reason="reconcile_stale",
-                        notes="Closed externally while bot was offline",
-                        strategy_type=pos.strategy_type,
-                        leverage=pos.leverage,
-                        entry_swing_price=pos.entry_swing_price,
-                    )
-                    log_taxable_event(
-                        "trade_close", asset, pos.remaining_size_coin * exit_price,
-                        pnl_usd=pnl_usd, notes="reconcile_stale",
-                    )
-                except Exception as log_err:
-                    logger.warning(f"Failed to log stale close for {asset}: {log_err}")
-
+            # --- ghost cleanup: in state but NOT on the exchange ---
+            # The position is already gone on the exchange; we do NOT know the real
+            # exit price/time, so we must NOT fabricate a DB close row (that is
+            # exactly the phantom-close Bug C warned against). Remove + alert only.
+            ghost_assets = [a for a in self.positions if a not in exchange_positions]
+            for asset in ghost_assets:
+                logger.warning(
+                    f"{tag}: GHOST {asset} in state but not on exchange — removing "
+                    f"from state (real exit unknown, NO DB row written)."
+                )
                 self.positions.pop(asset, None)
-
-            if stale_assets:
+            if ghost_assets:
                 self._save_state()
                 try:
                     from notifications.telegram import notify_critical_error
                     notify_critical_error(
-                        f"Cleaned {len(stale_assets)} stale positions on startup: {stale_assets}",
-                        "stale_state",
+                        f"{tag}: state had {len(ghost_assets)} ghost position(s) not on "
+                        f"exchange, cleaned without a DB close row (real exit unknown): "
+                        f"{ghost_assets}",
+                        "reconcile_ghost",
                     )
                 except Exception:
                     pass
 
-            # Import exchange-only positions (default ke spot long, SL pct)
+            # --- orphan adoption: on the exchange but NOT in state ---
             imported_assets = []
             for asset, szi in exchange_positions.items():
                 if asset in self.positions:
@@ -226,7 +253,7 @@ class OrderManager:
                 try:
                     entry_price = float(pos_data["entryPx"])
                 except (KeyError, ValueError, TypeError):
-                    logger.warning(f"Skipping import of {asset}: missing entryPx")
+                    logger.warning(f"{tag}: skipping orphan {asset}: missing entryPx")
                     continue
                 size_coin = abs(float(pos_data["szi"]))
                 is_long = float(pos_data["szi"]) > 0
@@ -249,31 +276,68 @@ class OrderManager:
                 )
                 imported_assets.append(asset)
                 logger.warning(
-                    f"IMPORTED {asset} from exchange: {size_coin} @ "
-                    f"${entry_price:.4f}, will set SL=${sl_price:.4f}"
+                    f"{tag}: adopted orphan {asset}: {size_coin} @ "
+                    f"${entry_price:.4f}, SL target=${sl_price:.4f}"
                 )
 
             if imported_assets:
                 try:
                     from notifications.telegram import notify_critical_error
                     notify_critical_error(
-                        f"Imported {len(imported_assets)} exchange positions on "
-                        f"startup: {imported_assets}",
-                        "startup_import",
+                        f"{tag}: adopted {len(imported_assets)} exchange orphan "
+                        f"position(s) into state: {imported_assets}",
+                        "reconcile_orphan",
                     )
                 except Exception:
                     pass
 
-            for asset, pos in self.positions.items():
-                if pos.remaining_size_coin > 0 and pos.current_sl_price > 0:
-                    logger.info(f"Re-placing SL for {asset} after startup reconcile")
-                    pos.sl_oid = self._place_stop_loss(
-                        asset, pos.remaining_size_coin, pos.current_sl_price, pos.is_long
-                    )
+            # --- SL check-before-replace (Bug D core) ---
+            # Adopt a live reduce-only SL's oid if one already rests; place a fresh
+            # SL ONLY when none is live. Never blank-then-replace → no gap with no
+            # hard SL. On an open-orders query failure (None) skip the sync this
+            # cycle: keep the existing sl_oid + the soft SL and retry next reconcile,
+            # rather than risk placing a duplicate SL on top of a live one.
+            live_sl = self._live_sl_orders()
+            if live_sl is None:
+                logger.warning(
+                    f"{tag}: open-orders query unavailable — skipping SL sync this "
+                    f"cycle (existing hard SL + soft SL retained, retry next cycle)."
+                )
+            else:
+                for asset, pos in self.positions.items():
+                    if pos.remaining_size_coin <= 0 or pos.current_sl_price <= 0:
+                        continue
+                    if asset in live_sl:
+                        # A hard SL already rests — adopt its oid, do NOT cancel or
+                        # re-place. The position is never left without an SL.
+                        if pos.sl_oid != live_sl[asset]:
+                            logger.info(
+                                f"{tag}: {asset} already has a live SL "
+                                f"(oid={live_sl[asset]}) — adopting, no re-place."
+                            )
+                        pos.sl_oid = live_sl[asset]
+                    else:
+                        logger.info(
+                            f"{tag}: no live SL for {asset} — placing one "
+                            f"@ ${pos.current_sl_price:.4f}."
+                        )
+                        pos.sl_oid = self._place_stop_loss(
+                            asset, pos.remaining_size_coin, pos.current_sl_price, pos.is_long
+                        )
             self._save_state()
 
         except Exception as e:
-            logger.exception(f"Reconcile failed: {e} — proceeding with local state (RISKY)")
+            logger.exception(
+                f"{tag} failed: {e} — proceeding with local state (RISKY)"
+            )
+            try:
+                from notifications.telegram import notify_critical_error
+                notify_critical_error(
+                    f"{tag} failed: {e} — proceeding with local state (RISKY)",
+                    "reconcile_failed",
+                )
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------ helpers
 

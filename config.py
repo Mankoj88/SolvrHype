@@ -82,6 +82,12 @@ SCAN_CYCLE_SECONDS = 300         # spot scan + management base loop runs every 5
 POSITION_MANAGE_INTERVAL_SECONDS = 60   # position management loop
 DERIVATIVE_SCAN_EVERY_N_CYCLES = 2      # 2 × 300s = 600s (10 min)
 
+# Bug D: periodic exchange/state reconciliation as a safety net (orphan/ghost +
+# SL drift). Bug C already fixed the main orphan source, so this is a backup, not
+# the primary defense — 360 min (6h) is plenty. Driven from the 60s management
+# loop (no separate thread); see Solvira._maybe_periodic_reconcile.
+RECONCILE_INTERVAL_MIN = int(os.getenv("RECONCILE_INTERVAL_MIN", "360"))
+
 # Hard cap survivor count yang di-fetch 5m candles per cycle. Mencegah
 # burst calls saat banyak aset lolos ctx pre-filter. 20 × 1 call/asset
 # = 20 calls/min, jauh di bawah HL rate limit (~60/min).

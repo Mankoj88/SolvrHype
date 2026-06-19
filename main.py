@@ -14,7 +14,7 @@ from config import (
     HYPERLIQUID_ACCOUNT, INITIAL_CAPITAL_USD,
     MAX_OPEN_POSITIONS_PER_STRATEGY, ENABLE_DERIVATIVE_STRATEGY,
     SCAN_CYCLE_SECONDS, POSITION_MANAGE_INTERVAL_SECONDS,
-    DERIVATIVE_SCAN_EVERY_N_CYCLES,
+    DERIVATIVE_SCAN_EVERY_N_CYCLES, RECONCILE_INTERVAL_MIN,
 )
 from strategy.spot_strategy import SpotStrategy
 from strategy.universe import UniverseFetcher
@@ -77,6 +77,11 @@ class Solvira:
         self.health = HealthMonitor()
         self.stop_loss_enforcer = StopLossEnforcer(initial_capital=INITIAL_CAPITAL_USD)
         self._schedule_stop = threading.Event()  # Bug #13
+        # Bug D: periodic reconcile clock. Startup reconcile already ran inside
+        # OrderManager.__init__, so seed this to "now" — the first PERIODIC run
+        # fires RECONCILE_INTERVAL_MIN later. monotonic() is immune to wall-clock
+        # adjustments.
+        self._last_reconcile_time = time.monotonic()
 
         # No reservation sync needed: allocation_manager.pool_used derives pool
         # usage directly from order_manager.positions (loaded + reconciled in
@@ -110,11 +115,49 @@ class Solvira:
                         assets = list(self.order_manager.positions.keys())
                         current_prices = self.get_current_prices(assets)
                         self.order_manager.manage_open_positions(current_prices)
+                    # Bug D: periodic reconcile runs INSIDE the same state_lock so
+                    # it can never overlap an in-flight entry/close (which would
+                    # corrupt state). It is gated to RECONCILE_INTERVAL_MIN.
+                    self._maybe_periodic_reconcile()
                 self.health.heartbeat()
             except Exception as e:
                 logger.exception(f"Position management error: {e}")
                 self.health.on_error(error_type=type(e).__name__)
             await asyncio.sleep(POSITION_MANAGE_INTERVAL_SECONDS)
+
+    def _maybe_periodic_reconcile(self):
+        """Bug D: fire _reconcile_with_exchange every RECONCILE_INTERVAL_MIN as a
+        drift safety net (orphan/ghost + SL resync).
+
+        Locking: this is called from inside position_management_loop's
+        `async with self.state_lock` block, so it is already serialized against
+        entries and closes. _reconcile_with_exchange is a SYNCHRONOUS OrderManager
+        method that does NOT touch state_lock, so there is no second acquire and no
+        deadlock on the non-reentrant asyncio.Lock — the lock is taken exactly once,
+        by the loop.
+
+        The interval clock is advanced BEFORE running so a persistent API outage
+        can't make reconcile spam every 60s; on failure it logs + alerts and the
+        next scheduled cycle retries. A failure here can never crash the loop:
+        _reconcile_with_exchange already swallows its own exceptions, and this
+        wrapper catches anything else as a belt-and-suspenders guard.
+        """
+        now = time.monotonic()
+        if now - self._last_reconcile_time < RECONCILE_INTERVAL_MIN * 60:
+            return
+        self._last_reconcile_time = now
+        logger.info(
+            f"Periodic reconcile: running exchange/state drift check "
+            f"(every {RECONCILE_INTERVAL_MIN} min, Bug D)"
+        )
+        try:
+            self.order_manager._reconcile_with_exchange(periodic=True)
+        except Exception as e:
+            logger.exception(f"Periodic reconcile crashed (loop continues): {e}")
+            try:
+                notify_critical_error(str(e), error_type="periodic_reconcile")
+            except Exception:
+                pass
 
     async def scan_and_entry_loop(self):
         """Runs every SCAN_CYCLE_SECONDS. Spot every cycle, derivative every DERIVATIVE_SCAN_EVERY_N_CYCLES cycles."""
