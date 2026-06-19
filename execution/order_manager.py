@@ -84,6 +84,12 @@ class Position:
 
 class OrderManager:
     STATE_FILE = DATA_DIR / "positions_state.json"
+    # Bug C fix: a full close must be CONFIRMED flat on the exchange before we
+    # record it closed. On an unconfirmed close, retry up to this many attempts
+    # total (with a short settle pause between) before keeping the position in
+    # state + alerting — never write a phantom "closed" row.
+    CLOSE_MAX_ATTEMPTS = 3
+    CLOSE_RETRY_SLEEP_SEC = 1.5
 
     def __init__(self):
         self.info = Info(get_api_url(), skip_ws=True)
@@ -468,10 +474,15 @@ class OrderManager:
                     f"vs signal ${signal.price:.6f} → {slippage_pct:.2f}% > {slippage_threshold_pct}% threshold. "
                     f"Closing immediately to avoid bad entry."
                 )
-                try:
-                    self.exchange.market_close(signal.asset)
-                except Exception as close_err:
-                    logger.error(f"Slippage-rollback close failed: {close_err}")
+                # Same verify-fill guard as the full-close path (Bug C): don't
+                # assume the rollback worked. If it can't be confirmed flat, the
+                # bad entry may still be open on the exchange → warn + alert.
+                if not self._attempt_close_until_flat(signal.asset):
+                    logger.error(
+                        f"Slippage-rollback close NOT confirmed for {signal.asset} — "
+                        f"bad entry may still be open on exchange"
+                    )
+                    self._alert_close_failed(signal.asset, "slippage_rollback", retained=False)
                 return False
 
             sl_price = self._resolve_sl_price(signal, actual_price)
@@ -560,8 +571,10 @@ class OrderManager:
                 else:
                     reason = "max_hold_ceiling" if favors_hold else "max_hold_psar_flip"
                     logger.info(f"⏰ MAX_HOLD {asset}: {time_held_hours:.1f}h close ({reason})")
-                    self._close_full_position(asset, reason, current_price)
-                    positions_to_remove.append(asset)
+                    # Remove from state ONLY on a confirmed close. If unconfirmed,
+                    # keep it so the next cycle retries (Bug C: no phantom close).
+                    if self._close_full_position(asset, reason, current_price):
+                        positions_to_remove.append(asset)
                     continue
 
             if self._sl_triggered(pos, current_price):
@@ -574,8 +587,10 @@ class OrderManager:
                 reason = "sl" if pos.tp_hit_count == 0 else "be_stop"
                 if pos.sl_mode in ("swing_low", "swing_high"):
                     reason = "structure_break"
-                self._close_full_position(asset, reason, current_price)
-                positions_to_remove.append(asset)
+                # Remove from state ONLY on a confirmed close. If unconfirmed,
+                # keep it so the next cycle retries (Bug C: no phantom close).
+                if self._close_full_position(asset, reason, current_price):
+                    positions_to_remove.append(asset)
                 continue
 
             # TP iterate. Format normalisasi: (pct, sell_frac, post_action)
@@ -675,17 +690,113 @@ class OrderManager:
         pos.sl_oid = new_oid
         logger.info(f"📐 BE_STOP {pos.asset}: SL → ${new_sl_price:.4f} (size={remaining_size})")
 
-    def _close_full_position(self, asset: str, reason: str, current_price: float):
+    def _is_position_flat(self, asset: str) -> Optional[bool]:
+        """Re-query the exchange and report whether `asset` has no open position.
+
+        Returns:
+          True  → asset absent or szi == 0 (definitively flat).
+          False → asset still open (szi != 0) OR the re-query failed (we cannot
+                  confirm closed, so conservatively treat as NOT flat → retry).
+          None  → no info client available (e.g. a unit-test harness built via
+                  object.__new__ without `self.info`). A live OrderManager ALWAYS
+                  has self.info (set in __init__), so None never occurs in
+                  production; callers fall back to the SDK status in that case.
+        """
+        info = getattr(self, "info", None)
+        if info is None:
+            return None
+        try:
+            user_state = info.user_state(HYPERLIQUID_ACCOUNT)
+        except Exception as e:
+            logger.warning(f"Flat-check query failed for {asset}: {e}")
+            return False
+        for p in (user_state or {}).get("assetPositions", []):
+            position = p.get("position", {})
+            if position.get("coin") == asset:
+                try:
+                    return float(position.get("szi", 0) or 0) == 0
+                except (TypeError, ValueError):
+                    return False
+        return True  # not present in assetPositions → flat
+
+    def _close_confirmed(self, asset: str, result) -> bool:
+        """True iff a close attempt is confirmed. The exchange re-query
+        (_is_position_flat) is the definitive signal — it catches partial/zero
+        fills that still report status="ok". Only when no info client is present
+        (None) do we fall back to the SDK status check, mirroring the
+        _execute_partial_tp pattern (`result.get("status") == "ok"`)."""
+        flat = self._is_position_flat(asset)
+        if flat is None:
+            return bool(result) and result.get("status") == "ok"
+        return flat
+
+    def _attempt_close_until_flat(self, asset: str) -> bool:
+        """Market-close `asset`, retrying up to CLOSE_MAX_ATTEMPTS until the
+        exchange confirms it flat. Returns True iff confirmed closed. Does NOT
+        mutate self.positions or write the trade log — the caller decides what to
+        do with the result (Bug C: never record a close that isn't confirmed)."""
+        for attempt in range(1, self.CLOSE_MAX_ATTEMPTS + 1):
+            result = None
+            try:
+                result = self.exchange.market_close(asset)
+            except Exception as e:
+                logger.warning(
+                    f"market_close {asset} attempt {attempt}/{self.CLOSE_MAX_ATTEMPTS} "
+                    f"raised: {e}"
+                )
+            if self._close_confirmed(asset, result):
+                if attempt > 1:
+                    logger.info(f"{asset} close confirmed on attempt {attempt}")
+                return True
+            status = result.get("status") if isinstance(result, dict) else None
+            logger.warning(
+                f"⚠️ Close NOT confirmed for {asset} "
+                f"(attempt {attempt}/{self.CLOSE_MAX_ATTEMPTS}, status={status}) — "
+                f"position may still be open on exchange"
+            )
+            if attempt < self.CLOSE_MAX_ATTEMPTS:
+                time.sleep(self.CLOSE_RETRY_SLEEP_SEC)
+        return False
+
+    def _alert_close_failed(self, asset: str, reason: str, retained: bool):
+        """Telegram alert when a close could not be confirmed after all retries."""
+        tail = ("kept in state for retry" if retained
+                else "position was NOT in managed state")
+        logger.error(
+            f"CLOSE FAILED {asset} after {self.CLOSE_MAX_ATTEMPTS} attempts — {tail} "
+            f"(reason={reason})"
+        )
+        try:
+            from notifications.telegram import notify_critical_error
+            notify_critical_error(
+                f"⚠️ CLOSE FAILED {asset} after {self.CLOSE_MAX_ATTEMPTS} attempts — "
+                f"position may still be open on exchange, {tail}. reason={reason}",
+                "close_failed",
+            )
+        except Exception as alert_err:
+            logger.warning(f"Failed to send close-failed alert for {asset}: {alert_err}")
+
+    def _close_full_position(self, asset: str, reason: str, current_price: float) -> bool:
+        """Close the full remaining position. Returns True ONLY when the close is
+        confirmed flat on the exchange — and ONLY then records it to the DB.
+
+        On an unconfirmed close (error status, None return, zero/partial fill, or
+        an exception) the position is KEPT in self.positions and an alert is sent,
+        so the soft-SL/management loop retries it next cycle. This is the Bug C
+        fix: previously the result was ignored and the trade was recorded closed +
+        popped unconditionally, orphaning still-open positions (the LIT phantom)."""
         if DRY_RUN:
             logger.info(f"[DRY_RUN] Close {asset}: {reason}")
             self._on_position_close_full(asset, current_price, reason)
-            return
-        try:
-            self.exchange.market_close(asset)
+            return True
+
+        if self._attempt_close_until_flat(asset):
             logger.info(f"✅ CLOSED {asset}: {reason}")
             self._on_position_close_full(asset, current_price, reason)
-        except Exception as e:
-            logger.exception(f"Close failed: {e}")
+            return True
+
+        self._alert_close_failed(asset, reason, retained=True)
+        return False
 
     def _on_position_close_partial(self, asset: str, exit_price: float,
                                     exit_reason: str, size_sold: float):
