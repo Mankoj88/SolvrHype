@@ -36,9 +36,19 @@ def test_wallet_cache_consistent_under_concurrent_reads(stress_info, stress_exch
         try:
             for _ in range(200):
                 bal = reader.get_unified_balance()
-                # All fields populated and total_equity is the sum
-                got_total = bal.perp_equity + bal.spot_usdc + bal.spot_tokens_value_usd
-                if abs(got_total - bal.total_equity) > 1e-6:
+                # Coherence invariant for the unified-account design:
+                #   perp_equity is PROPAGATED to equal total_equity (so
+                #   get_total_capital reads the corrected unified figure), and
+                #   held USDC can never exceed total USDC. A torn read mixing
+                #   fields from two different fetches would break one of these.
+                # (Pre-fix this asserted perp_equity + spot_usdc + tokens ==
+                #  total_equity, which double-added spot_usdc once perp_equity
+                #  started carrying the propagated total — Bug A equity fix.)
+                coherent = (
+                    abs(bal.perp_equity - bal.total_equity) <= 1e-6
+                    and bal.spot_usdc_hold <= bal.spot_usdc + 1e-9
+                )
+                if not coherent:
                     errors.append(("torn", bal.to_dict()))
                 results.append(bal.total_equity)
         except Exception as e:
