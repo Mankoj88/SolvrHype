@@ -506,7 +506,16 @@ class OrderManager:
             )
 
             sl_oid = self._place_stop_loss(signal.asset, actual_size, sl_price, signal.is_long)
-            position.sl_oid = sl_oid
+            position.sl_oid = sl_oid  # real oid on success, None on failure
+            if sl_oid is None:
+                # Hard SL didn't land (genuine API rejection, etc). Do NOT roll back
+                # the entry — the soft SL in manage_open_positions() still protects
+                # this position — but make the gap loud so we're not silently
+                # unprotected (Bug B failure-path visibility).
+                logger.warning(
+                    f"⚠️ Hard SL placement failed for {signal.asset} — relying on soft SL"
+                )
+                self._alert_sl_placement_failed(signal.asset)
 
             self.positions[signal.asset] = position
             self._save_state()
@@ -525,13 +534,18 @@ class OrderManager:
     def _place_stop_loss(self, asset: str, size: float, trigger_price: float,
                          is_long: bool = True) -> Optional[int]:
         """SL order: long → sell when price <= trigger; short → buy when price >= trigger."""
+        # Bug B: the SDK's signing.float_to_wire formats every price with
+        # f"{x:.8f}", which raises "Unknown format code 'f' for object of type
+        # 'str'" if it receives a string. triggerPx (and limit_px) MUST be floats —
+        # never str()-wrapped. Coerce defensively in case a caller hands us a string.
+        trigger_price = float(trigger_price)
         try:
             result = self.exchange.order(
                 asset,
                 not is_long,  # opposite side
                 size,
-                trigger_price,
-                {"trigger": {"isMarket": True, "triggerPx": str(trigger_price), "tpsl": "sl"}},
+                trigger_price,  # limit_px → float_to_wire (must be float, not str)
+                {"trigger": {"isMarket": True, "triggerPx": trigger_price, "tpsl": "sl"}},
                 reduce_only=True,
             )
             if result["status"] == "ok":
@@ -775,6 +789,22 @@ class OrderManager:
             )
         except Exception as alert_err:
             logger.warning(f"Failed to send close-failed alert for {asset}: {alert_err}")
+
+    def _alert_sl_placement_failed(self, asset: str):
+        """Telegram alert when a hard SL order could not be placed (Bug B).
+
+        The entry is NOT rolled back — the soft SL in manage_open_positions() still
+        protects the position — but we surface the gap so it isn't silent."""
+        try:
+            from notifications.telegram import notify_critical_error
+            notify_critical_error(
+                f"⚠️ Hard SL placement failed for {asset}, relying on soft SL",
+                "sl_placement_failed",
+            )
+        except Exception as alert_err:
+            logger.warning(
+                f"Failed to send SL-placement-failed alert for {asset}: {alert_err}"
+            )
 
     def _close_full_position(self, asset: str, reason: str, current_price: float) -> bool:
         """Close the full remaining position. Returns True ONLY when the close is
