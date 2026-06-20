@@ -357,7 +357,12 @@ class OrderManager:
         except Exception as e:
             logger.warning(f"Failed to set leverage for {asset}: {e}")
 
-    def _round_size(self, asset: str, size: float) -> float:
+    def _sz_decimals(self, asset: str) -> int:
+        """szDecimals for an asset, cached (one meta() round-trip per asset).
+
+        Shared by _round_size and _round_price so the lookup/cache logic lives in
+        exactly one place.
+        """
         if asset not in self._szDecimals_cache:
             meta = self.info.meta()
             for asset_info in meta["universe"]:
@@ -366,7 +371,52 @@ class OrderManager:
                     break
             else:
                 self._szDecimals_cache[asset] = 4
-        return round(size, self._szDecimals_cache[asset])
+        return self._szDecimals_cache[asset]
+
+    def _round_size(self, asset: str, size: float) -> float:
+        return round(size, self._sz_decimals(asset))
+
+    def _round_price(self, asset: str, price: float) -> float:
+        """Round a price to Hyperliquid's wire-precision rule before sending an order.
+
+        Hyperliquid rejects any order price with more than 5 significant figures, OR
+        more than (MAX_DECIMALS - szDecimals) decimal places, where MAX_DECIMALS is 6
+        for perps and 8 for spot (integer prices are always allowed). The SDK applies
+        this for market_open via _slippage_price, but exchange.order (our manual SL
+        path) does NOT — so an unrounded SL trigger such as 1663.452 / 67.54062 was
+        rejected IN-BAND by the exchange and the SL silently never landed. Mirror the
+        SDK rule here so every price we submit is wire-valid.
+
+        These positions are perp-1x (labeled "spot"), so use the PERP cap of
+        (6 - szDecimals) decimals. If genuine spot markets are ever added, those
+        assets need 8 instead of 6.
+
+        Worked examples (perp):
+            1663.452 (ETH, szDecimals=4) → "{:.5g}"→1663.5, round(·, 6-4=2) → 1663.5
+            67.54062 (SOL, szDecimals=2) → "{:.5g}"→67.541, round(·, 6-2=4) → 67.541
+            63700.0  (already valid)                                        → 63700.0
+        """
+        price = float(price)
+        try:
+            return round(float(f"{price:.5g}"), 6 - self._sz_decimals(asset))
+        except Exception as e:
+            logger.warning(
+                f"_round_price: szDecimals lookup failed for {asset} ({e}); "
+                f"falling back to 5 sig figs / 6 decimals"
+            )
+            return round(float(f"{price:.5g}"), 6)
+
+    def _round_price_aggressive(self, asset: str, price: float) -> float:
+        """A rounder price for a precision-rejection retry: 4 significant figures and
+        one fewer decimal place than the standard rule, to clear a tick edge case
+        where the precisely-rounded value is still rejected. Only used on a retry —
+        never as the first attempt."""
+        price = float(price)
+        try:
+            decimals = max(0, (6 - self._sz_decimals(asset)) - 1)
+        except Exception:
+            decimals = 5
+        return round(float(f"{price:.4g}"), decimals)
 
     def _close_side(self, pos: Position) -> str:
         if pos.strategy_type == "derivative":
@@ -571,15 +621,10 @@ class OrderManager:
 
             sl_oid = self._place_stop_loss(signal.asset, actual_size, sl_price, signal.is_long)
             position.sl_oid = sl_oid  # real oid on success, None on failure
-            if sl_oid is None:
-                # Hard SL didn't land (genuine API rejection, etc). Do NOT roll back
-                # the entry — the soft SL in manage_open_positions() still protects
-                # this position — but make the gap loud so we're not silently
-                # unprotected (Bug B failure-path visibility).
-                logger.warning(
-                    f"⚠️ Hard SL placement failed for {signal.asset} — relying on soft SL"
-                )
-                self._alert_sl_placement_failed(signal.asset)
+            # On failure _place_stop_loss has already logged the exact exchange
+            # rejection reason and fired the Telegram alert (centralized). The entry
+            # is NOT rolled back — the soft SL in manage_open_positions() still
+            # protects this position.
 
             self.positions[signal.asset] = position
             self._save_state()
@@ -595,30 +640,119 @@ class OrderManager:
             logger.exception(f"Entry exception for {signal.asset}: {e}")
             return False
 
-    def _place_stop_loss(self, asset: str, size: float, trigger_price: float,
-                         is_long: bool = True) -> Optional[int]:
-        """SL order: long → sell when price <= trigger; short → buy when price >= trigger."""
-        # Bug B: the SDK's signing.float_to_wire formats every price with
-        # f"{x:.8f}", which raises "Unknown format code 'f' for object of type
-        # 'str'" if it receives a string. triggerPx (and limit_px) MUST be floats —
-        # never str()-wrapped. Coerce defensively in case a caller hands us a string.
-        trigger_price = float(trigger_price)
+    @staticmethod
+    def _is_price_error(text: str) -> bool:
+        """Heuristic: does an exchange rejection string indicate a price/precision
+        problem? If so a retry must use a ROUNDER price — re-sending the same value
+        would fail identically. Otherwise the failure is treated as transient."""
+        t = (text or "").lower()
+        return any(k in t for k in ("price", "tick", "significant", "decimal"))
+
+    def _submit_sl_order(self, asset: str, size: float, px: float, is_long: bool):
+        """Submit ONE reduce-only stop-market order. No rounding/retry here.
+
+        Returns (oid, reason, price_error):
+          * success      → (int oid, None, False)
+          * placed/acted → (None, None, False)   e.g. immediate fill, no resting oid
+          * failure      → (None, reason str, price_error bool)
+        The reason is ALWAYS surfaced (logged) — a precision rejection comes back as
+        status="ok" with an in-band {"error": ...} status, which used to be swallowed.
+        """
         try:
             result = self.exchange.order(
                 asset,
-                not is_long,  # opposite side
+                not is_long,            # opposite side
                 size,
-                trigger_price,  # limit_px → float_to_wire (must be float, not str)
-                {"trigger": {"isMarket": True, "triggerPx": trigger_price, "tpsl": "sl"}},
+                px,                     # limit_px → float_to_wire (must be float, not str)
+                {"trigger": {"isMarket": True, "triggerPx": px, "tpsl": "sl"}},
                 reduce_only=True,
             )
-            if result["status"] == "ok":
-                statuses = result["response"]["data"]["statuses"]
-                resting = next((s["resting"] for s in statuses if "resting" in s), None)
-                if resting:
-                    return int(resting["oid"])
         except Exception as e:
-            logger.error(f"SL placement failed for {asset}: {e}")
+            # Transport/signing exception — transient, retry the same value.
+            logger.exception(f"SL order exception for {asset} @ {px}: {e}")
+            return None, f"exception: {e}", False
+
+        if result.get("status") != "ok":
+            logger.error(f"SL order non-ok for {asset} @ {px}: {result}")
+            return None, f"status={result.get('status')} {result}", self._is_price_error(str(result))
+
+        statuses = result.get("response", {}).get("data", {}).get("statuses", [])
+        # In-band rejection (the previously-swallowed case): status ok but the order
+        # was rejected, e.g. {"error": "Order has invalid price."}. ALWAYS log it.
+        err = next((s["error"] for s in statuses if isinstance(s, dict) and "error" in s), None)
+        if err:
+            logger.error(f"SL order rejected for {asset} @ {px}: {err}")
+            return None, str(err), self._is_price_error(str(err))
+
+        resting = next((s["resting"] for s in statuses if isinstance(s, dict) and "resting" in s), None)
+        if resting:
+            return int(resting["oid"]), None, False
+
+        # Immediate fill on submit (rare for a stop): the SL acted rather than
+        # resting. Not a failure — there's just no resting oid to track.
+        filled = next((s["filled"] for s in statuses if isinstance(s, dict) and "filled" in s), None)
+        if filled:
+            oid = filled.get("oid")
+            logger.warning(f"SL for {asset} filled immediately on submit: {filled}")
+            return (int(oid) if oid else None), None, False
+
+        logger.error(f"SL order unexpected response for {asset} @ {px}: {result}")
+        return None, f"no resting/error/filled in statuses: {statuses}", False
+
+    def _place_stop_loss(self, asset: str, size: float, trigger_price: float,
+                         is_long: bool = True) -> Optional[int]:
+        """Place a hard (reduce-only stop-market) SL: long → sell when price <=
+        trigger; short → buy when price >= trigger. Returns the resting oid, or None.
+
+        The trigger/limit price is rounded to Hyperliquid's wire-precision rule via
+        _round_price BEFORE sending — exchange.order does NOT auto-round the way the
+        SDK's market_open does (Bug: unrounded triggers like 1663.452 / 67.54062 were
+        rejected in-band and the SL silently never landed). Rounding here covers ALL
+        callers (entry, reconcile, BE-stop) in one place.
+
+        On failure we retry ONCE, but never re-send the identical request that just
+        failed for a price reason: a precision rejection retries with a rounder price;
+        a transient error retries the same price after a short pause. If the retry
+        also fails we log the reason, fire a Telegram alert, and return None — the
+        entry is NOT rolled back (the soft SL in manage_open_positions still covers).
+        """
+        # Bug B: float_to_wire formats every price with f"{x:.8f}" and raises on a
+        # str, so the price MUST be a float. _round_price float()-coerces and rounds.
+        px = self._round_price(asset, trigger_price)
+
+        oid, reason, price_error = self._submit_sl_order(asset, size, px, is_long)
+        if oid is not None:
+            return oid
+        if reason is None:
+            return None  # placed/acted but no trackable oid — not a failure
+
+        # --- conditional retry: only in a way that can actually succeed ---
+        if price_error:
+            # Precision/tick rejection — the same value would fail again. Retry with
+            # a more aggressively rounded price (4 sig figs / one fewer decimal).
+            retry_px = self._round_price_aggressive(asset, px)
+            logger.warning(
+                f"SL retry (price) {asset}: {px} rejected ({reason}) → retry @ {retry_px}"
+            )
+        else:
+            # Transient (network/timeout/exception/non-price) — same price, brief pause.
+            retry_px = px
+            logger.warning(
+                f"SL retry (transient) {asset}: {reason} → retry @ {retry_px} after 1s"
+            )
+            time.sleep(1)
+
+        oid, reason, _ = self._submit_sl_order(asset, size, retry_px, is_long)
+        if oid is not None:
+            return oid
+        if reason is None:
+            return None
+
+        logger.error(
+            f"⚠️ Hard SL placement failed for {asset}: {reason} "
+            f"(size={size}, trigger={px}) — relying on soft SL"
+        )
+        self._alert_sl_placement_failed(asset, reason)
         return None
 
     def _cancel_order(self, asset: str, oid: int):
@@ -854,15 +988,17 @@ class OrderManager:
         except Exception as alert_err:
             logger.warning(f"Failed to send close-failed alert for {asset}: {alert_err}")
 
-    def _alert_sl_placement_failed(self, asset: str):
+    def _alert_sl_placement_failed(self, asset: str, reason: str = None):
         """Telegram alert when a hard SL order could not be placed (Bug B).
 
         The entry is NOT rolled back — the soft SL in manage_open_positions() still
-        protects the position — but we surface the gap so it isn't silent."""
+        protects the position — but we surface the gap (with the exchange's exact
+        rejection reason when known) so it isn't silent."""
+        detail = f": {reason}" if reason else ""
         try:
             from notifications.telegram import notify_critical_error
             notify_critical_error(
-                f"⚠️ Hard SL placement failed for {asset}, relying on soft SL",
+                f"⚠️ Hard SL placement failed for {asset}{detail} — relying on soft SL",
                 "sl_placement_failed",
             )
         except Exception as alert_err:
