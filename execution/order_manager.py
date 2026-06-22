@@ -1088,6 +1088,12 @@ class OrderManager:
             logger.warning(f"Partial fee computation failed for {asset}: {e}")
             fees_usd = 0.0
 
+        try:
+            logger.info(f"FEE {asset}: source=partial_estimate value=${fees_usd:.4f} "
+                        f"size_sold={size_sold}")
+        except Exception:
+            pass
+
         log_trade(
             asset=asset,
             side=self._partial_close_side(pos),
@@ -1147,6 +1153,13 @@ class OrderManager:
         except Exception as e:
             logger.warning(f"Fee computation failed for {asset}: {e}")
             fees_usd = 0.0
+
+        try:
+            _src = "actual" if actual is not None else "estimate"
+            logger.info(f"FEE {asset}: source={_src} value=${fees_usd:.4f} "
+                        f"strat={pos.strategy_type} tp_hits={pos.tp_hit_count}")
+        except Exception:
+            pass
 
         log_trade(
             asset=asset,

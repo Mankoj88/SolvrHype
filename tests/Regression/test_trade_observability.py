@@ -19,9 +19,11 @@ Uses object.__new__(OrderManager) — the established harness pattern in this re
 """
 import sqlite3
 import json
+from contextlib import contextmanager
 from unittest.mock import MagicMock
 
 import pytest
+from loguru import logger
 
 from execution.order_manager import OrderManager, Position
 from config import TAKER_FEE_RATE
@@ -155,3 +157,62 @@ def test_actual_fees_used_when_fills_present(om, trades_db, no_side_effects):
 
     row = _rows(trades_db)[0]
     assert row["fees_usd"] == pytest.approx(0.0181 + 0.0190)
+
+
+# ---------------------------------------------------------------------------
+# FEE-source log line (actual | estimate | partial_estimate) — observability
+# only. Captured via a loguru INFO sink, the same pattern the SL-placement
+# regressions use.
+# ---------------------------------------------------------------------------
+
+@contextmanager
+def _capture_info():
+    """Collect INFO+ loguru messages emitted inside the block."""
+    msgs = []
+    sink_id = logger.add(lambda m: msgs.append(m.record["message"]), level="INFO")
+    try:
+        yield msgs
+    finally:
+        logger.remove(sink_id)
+
+
+def test_full_close_no_fills_logs_source_estimate(om, trades_db, no_side_effects):
+    """(a) No real fills (DRY_RUN / empty user_fills) → FEE log says source=estimate."""
+    om.positions["SOL"] = _position()
+    with _capture_info() as msgs:
+        om._on_position_close_full("SOL", exit_price=155.0, exit_reason="tp2")
+
+    fee_logs = [m for m in msgs if m.startswith("FEE SOL:")]
+    assert len(fee_logs) == 1, f"expected exactly one FEE log, got {fee_logs}"
+    assert "source=estimate" in fee_logs[0]
+    assert "source=actual" not in fee_logs[0]
+    assert "tp_hits=0" in fee_logs[0]
+
+
+def test_full_close_with_fills_logs_source_actual(om, trades_db, no_side_effects):
+    """(b) Real fills present → FEE log says source=actual."""
+    pos = _position()
+    om.positions["SOL"] = pos
+    om.info.user_fills = MagicMock(return_value=[
+        {"coin": "SOL", "time": pos.entry_time_ms + 10, "fee": "0.0181"},
+        {"coin": "SOL", "time": pos.entry_time_ms + 5_000, "fee": "0.0190"},
+    ])
+    with _capture_info() as msgs:
+        om._on_position_close_full("SOL", exit_price=155.0, exit_reason="tp2")
+
+    fee_logs = [m for m in msgs if m.startswith("FEE SOL:")]
+    assert len(fee_logs) == 1, f"expected exactly one FEE log, got {fee_logs}"
+    assert "source=actual" in fee_logs[0]
+
+
+def test_partial_close_logs_source_partial_estimate(om, trades_db, no_side_effects):
+    """(c) Partial close → FEE log says source=partial_estimate (never actual/estimate)."""
+    om.positions["SOL"] = _position()
+    with _capture_info() as msgs:
+        om._on_position_close_partial("SOL", exit_price=153.0, exit_reason="tp1",
+                                      size_sold=0.135)
+
+    fee_logs = [m for m in msgs if m.startswith("FEE SOL:")]
+    assert len(fee_logs) == 1, f"expected exactly one FEE log, got {fee_logs}"
+    assert "source=partial_estimate" in fee_logs[0]
+    assert "size_sold=0.135" in fee_logs[0]
