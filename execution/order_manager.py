@@ -30,6 +30,7 @@ from config import (
     INITIAL_CAPITAL_USD,
     SPOT, DERIVATIVE,
     PSAR_STEP, PSAR_MAX_STEP, PSAR_HOLD_MAX_HOURS,
+    TAKER_FEE_RATE,
 )
 from strategy.base_strategy import TradeSignal
 
@@ -67,6 +68,11 @@ class Position:
     entry_swing_price: Optional[float] = None     # swing low (long) atau high (short)
     sl_mode: str = "pct"                          # "pct" | "swing_low" | "swing_high"
     risk_usd: Optional[float] = None              # audit field untuk risk-based sizing
+    # Observability (informational only — NO trading decision may read these)
+    indicators_snapshot: Optional[dict] = None    # indicator values captured at entry
+    max_favorable_pct: float = 0.0                # MFE: best direction-% seen while open
+    max_adverse_pct: float = 0.0                  # MAE: worst direction-% seen while open
+    fees_partial_usd: float = 0.0                 # accumulated partial-close fee estimates
 
     def __post_init__(self):
         if self.remaining_size_coin == 0.0 and self.entry_size_coin > 0:
@@ -557,6 +563,7 @@ class OrderManager:
                 entry_swing_price=signal.suggested_sl_price if signal.sl_mode in ("swing_low", "swing_high") else None,
                 sl_mode=signal.sl_mode,
                 risk_usd=size_usd,
+                indicators_snapshot=signal.indicators_snapshot,
             )
             self._save_state()
             return True
@@ -617,6 +624,7 @@ class OrderManager:
                 entry_swing_price=signal.suggested_sl_price if signal.sl_mode in ("swing_low", "swing_high") else None,
                 sl_mode=signal.sl_mode,
                 risk_usd=size_usd,
+                indicators_snapshot=signal.indicators_snapshot,
             )
 
             sl_oid = self._place_stop_loss(signal.asset, actual_size, sl_price, signal.is_long)
@@ -772,6 +780,10 @@ class OrderManager:
                 continue
             current_price = current_prices[asset]
             pct_change = self._direction_pct_change(pos, current_price)
+            # Observability only (MFE/MAE) — reads already-available current_price,
+            # NO decision below may use these. Behavior-neutral.
+            pos.max_favorable_pct = max(pos.max_favorable_pct, pct_change)
+            pos.max_adverse_pct = min(pos.max_adverse_pct, pct_change)
             time_held_hours = (time.time() * 1000 - pos.entry_time_ms) / 3600_000
 
             if time_held_hours >= self._max_hold_hours(pos):
@@ -1028,6 +1040,29 @@ class OrderManager:
         self._alert_close_failed(asset, reason, retained=True)
         return False
 
+    def _realized_fees_for(self, asset: str, since_ms: int) -> Optional[float]:
+        """Sum the ACTUAL fees (USD) charged on `asset` since `since_ms`, read from
+        the exchange fill history (user_fills). This is the whole round-trip cost
+        for a position opened at entry_time_ms.
+
+        Returns None when the query fails OR when there are no matching fills (e.g.
+        DRY_RUN, where no real orders were sent) — the caller then falls back to a
+        taker-rate estimate. Returning None rather than 0.0 on "no fills" is what
+        makes the estimate path run in DRY_RUN. Purely informational — never raises,
+        never affects a close."""
+        try:
+            fills = self.info.user_fills(HYPERLIQUID_ACCOUNT)
+            matched = [
+                f for f in (fills or [])
+                if f.get("coin") == asset and int(f.get("time", 0)) >= since_ms
+            ]
+            if not matched:
+                return None  # no real fills → caller uses the taker-rate estimate
+            return sum(float(f["fee"]) for f in matched)
+        except Exception as e:
+            logger.warning(f"Realized-fee lookup failed for {asset}: {e}")
+            return None
+
     def _on_position_close_partial(self, asset: str, exit_price: float,
                                     exit_reason: str, size_sold: float):
         from monitoring.trade_logger import log_trade
@@ -1042,6 +1077,17 @@ class OrderManager:
         pnl_pct = self._compute_pnl_pct(pos, exit_price)
         size_usd = size_sold * exit_price
 
+        # Fee: this partial's own taker fee (estimate). Accumulate on the Position
+        # so the full-close row can subtract it and keep SUM(fees_usd) == round-trip
+        # total. Fee math is best-effort and must never block the close.
+        fees_usd = 0.0
+        try:
+            fees_usd = size_usd * TAKER_FEE_RATE
+            pos.fees_partial_usd = (pos.fees_partial_usd or 0.0) + fees_usd
+        except Exception as e:
+            logger.warning(f"Partial fee computation failed for {asset}: {e}")
+            fees_usd = 0.0
+
         log_trade(
             asset=asset,
             side=self._partial_close_side(pos),
@@ -1053,11 +1099,15 @@ class OrderManager:
             exit_time_ms=int(time.time() * 1000),
             pnl_usd=pnl_usd,
             pnl_pct=pnl_pct,
+            fees_usd=fees_usd,
             exit_reason=exit_reason,
             notes=f"partial; size_sold={size_sold}",
             strategy_type=pos.strategy_type,
             leverage=pos.leverage,
             entry_swing_price=pos.entry_swing_price,
+            indicators_snapshot=pos.indicators_snapshot,
+            mfe_pct=pos.max_favorable_pct,
+            mae_pct=pos.max_adverse_pct,
         )
         log_taxable_event(
             "trade_partial_close", asset, size_usd,
@@ -1081,6 +1131,23 @@ class OrderManager:
         pnl_pct = self._compute_pnl_pct(pos, exit_price)
         size_usd = remaining * exit_price
 
+        # Fee: prefer the ACTUAL round-trip fees from fills; fall back to an
+        # entry+exit taker estimate when fills are unavailable (e.g. DRY_RUN).
+        # Subtract fees already logged on this position's partial rows so the
+        # per-position SUM(fees_usd) equals the round-trip total. Best-effort —
+        # must never block the close.
+        fees_usd = 0.0
+        try:
+            actual = self._realized_fees_for(asset, pos.entry_time_ms)
+            if actual is not None:
+                round_trip = actual                                # whole round-trip actual
+            else:
+                round_trip = pos.entry_size_usd * TAKER_FEE_RATE * 2  # entry+exit estimate
+            fees_usd = max(0.0, round_trip - (pos.fees_partial_usd or 0.0))
+        except Exception as e:
+            logger.warning(f"Fee computation failed for {asset}: {e}")
+            fees_usd = 0.0
+
         log_trade(
             asset=asset,
             side=self._close_side(pos),
@@ -1092,10 +1159,14 @@ class OrderManager:
             exit_time_ms=int(time.time() * 1000),
             pnl_usd=pnl_usd,
             pnl_pct=pnl_pct,
+            fees_usd=fees_usd,
             exit_reason=exit_reason,
             strategy_type=pos.strategy_type,
             leverage=pos.leverage,
             entry_swing_price=pos.entry_swing_price,
+            indicators_snapshot=pos.indicators_snapshot,
+            mfe_pct=pos.max_favorable_pct,
+            mae_pct=pos.max_adverse_pct,
         )
         log_taxable_event(
             "trade_close", asset, size_usd,

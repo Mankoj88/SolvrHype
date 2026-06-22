@@ -215,6 +215,11 @@ MAX_ACCEPTABLE_FUNDING_RATE_HOURLY = 0.005  # 0.5%/jam
 # === TRADING COOLDOWN ===
 COOLDOWN_AFTER_CLOSE_MINUTES = 60  # cooldown per asset setelah posisi close
 
+# === FEES ===
+TAKER_FEE_RATE = float(os.getenv("TAKER_FEE_RATE", "0.00045"))
+# HL base-tier perp taker = 0.045% of NOTIONAL (verified Jun 2026).
+# Re-check if 14-day volume tier changes.
+
 # === BRIDGE ===
 HL_BRIDGE_FEE_USD = 1.0  # Hyperliquid bridge withdrawal fee (flat $1)
 

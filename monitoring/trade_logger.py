@@ -105,6 +105,18 @@ def init_db():
                     pass  # column already exists
             conn.execute("PRAGMA user_version = 2")
 
+        if version < 3:
+            # v3: trade observability — max favorable/adverse excursion (%)
+            for sql in [
+                "ALTER TABLE trades ADD COLUMN mfe_pct REAL",
+                "ALTER TABLE trades ADD COLUMN mae_pct REAL",
+            ]:
+                try:
+                    conn.execute(sql)
+                except sqlite3.OperationalError:
+                    pass  # column already exists
+            conn.execute("PRAGMA user_version = 3")
+
         # Add future migrations here as version < N blocks
         final_version = conn.execute("PRAGMA user_version").fetchone()[0]
 
@@ -134,7 +146,8 @@ def migrate_schema(db_path: str):
 def log_trade(asset, side, size_coin, size_usd, entry_price=None, exit_price=None,
               entry_time_ms=None, exit_time_ms=None, pnl_usd=None, pnl_pct=None,
               fees_usd=0, exit_reason=None, indicators_snapshot=None, notes=None,
-              strategy_type="spot", leverage=1, entry_swing_price=None):
+              strategy_type="spot", leverage=1, entry_swing_price=None,
+              mfe_pct=None, mae_pct=None):
     entry_time = (datetime.fromtimestamp(entry_time_ms/1000, tz=timezone.utc).isoformat()
                   if entry_time_ms else None)
     exit_time = (datetime.fromtimestamp(exit_time_ms/1000, tz=timezone.utc).isoformat()
@@ -149,12 +162,14 @@ def log_trade(asset, side, size_coin, size_usd, entry_price=None, exit_price=Non
                 entry_time_utc, exit_time_utc, hold_duration_seconds,
                 pnl_usd, pnl_pct, fees_usd, exit_reason,
                 indicators_snapshot, notes,
-                strategy_type, leverage, entry_swing_price
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                strategy_type, leverage, entry_swing_price,
+                mfe_pct, mae_pct
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (asset, side, entry_price, exit_price, size_coin, size_usd,
               entry_time, exit_time, duration, pnl_usd, pnl_pct, fees_usd, exit_reason,
               json.dumps(indicators_snapshot) if indicators_snapshot else None, notes,
-              strategy_type, leverage, entry_swing_price))
+              strategy_type, leverage, entry_swing_price,
+              mfe_pct, mae_pct))
 
 
 def log_daily_snapshot(capital_usd, open_positions_count, open_positions_value_usd,
