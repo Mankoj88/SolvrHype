@@ -20,7 +20,7 @@ from execution.allocation_manager import AllocationManager
 from execution.order_manager import Position
 from config import (
     MIN_POSITION_SIZE_USD, MAX_POSITION_SIZE_USD,
-    STRATEGY_POOL_SPLIT,
+    STRATEGY_POOL_SPLIT, SPOT,
 )
 from strategy.base_strategy import TradeSignal
 
@@ -134,21 +134,24 @@ def test_close_releases_pool_fully_no_leak():
 
 
 def test_spot_pool_exhaustion_then_recovery():
-    """Fill up to 3 spot slots → next sizing must return 0; close one → can
-    size again."""
+    """Fill every spot slot → next sizing must return 0; close one → can size
+    again. Slot count is config-driven (len(SPOT['allocation_split'])) so this
+    holds under any spot-cap / pool override."""
     om = FakeOrderManager()
     am = AllocationManager(order_manager=om)
     capital = 2000.0
 
-    for asset in ("A", "B", "C"):
+    n_slots = len(SPOT["allocation_split"])
+    assets = [f"A{i}" for i in range(n_slots)]
+    for asset in assets:
         s = am.calculate_position_size(asset, capital, "spot")
         assert s > 0, f"slot for {asset} unexpectedly 0"
         _open(om, asset, s, "spot")
 
-    # 4th attempt: no slot left (only 3 slots in SPOT['allocation_split']).
-    s4 = am.calculate_position_size("D", capital, "spot")
-    assert s4 == 0, f"expected pool exhaustion → 0, got {s4}"
+    # One slot past the last: no slot left (len(allocation_split) exhausted).
+    s_over = am.calculate_position_size("OVERFLOW", capital, "spot")
+    assert s_over == 0, f"expected pool exhaustion → 0, got {s_over}"
 
-    om.positions.pop("A", None)
-    s_after = am.calculate_position_size("D", capital, "spot")
+    om.positions.pop(assets[0], None)
+    s_after = am.calculate_position_size("OVERFLOW", capital, "spot")
     assert s_after > 0, "expected recovery after close"

@@ -70,8 +70,16 @@ MAX_HOLD_HOURS = 6
 SLIPPAGE_TOLERANCE = 0.005
 
 # === DUAL-STRATEGY (new dual spot+derivative architecture) ===
-STRATEGY_POOL_SPLIT = {"spot": 0.50, "derivative": 0.50}
-MAX_OPEN_POSITIONS_PER_STRATEGY = {"spot": 3, "derivative": 2}
+# Capital pool split between strategies. SPOT_POOL_PCT=1.0 (default while
+# derivative is OFF) gives the derivative pool 0.0 by construction, so no
+# capital can flow to derivative even if ENABLE_DERIVATIVE is flipped on.
+# Override via .env (SPOT_POOL_PCT) for instant rollback — no redeploy.
+_spot_pool = float(os.getenv("SPOT_POOL_PCT", "1.0"))   # 1.0 while derivative OFF
+STRATEGY_POOL_SPLIT = {"spot": _spot_pool, "derivative": round(1.0 - _spot_pool, 6)}
+MAX_OPEN_POSITIONS_PER_STRATEGY = {
+    "spot": int(os.getenv("MAX_SPOT_POSITIONS", "5")),
+    "derivative": int(os.getenv("MAX_DERIV_POSITIONS", "2")),
+}
 ENABLE_DERIVATIVE_STRATEGY = os.getenv("ENABLE_DERIVATIVE", "false").lower() == "true"
 # Universe ctx (dayNtlVlm, prevDayPx, funding) berubah terus, harus fresh tiap
 # cycle. Cycle = 60s, jadi cache 60s = 1 API call/menit untuk universe.
@@ -161,7 +169,9 @@ DERIVATIVE = {
 # derivative margin are already capped well below it by pool capacity), so
 # lowering it adds no protection.
 MAX_POSITION_SIZE_USD = 500
-MAX_OPEN_POSITIONS = 3
+# Total concurrent positions across all strategies. Default 5 (spot scale-up
+# while derivative is OFF). Override via .env (MAX_OPEN_POSITIONS) to roll back.
+MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "5"))
 # Lowered 50 -> 10 (operator decision) so small pools can trade down to the
 # Hyperliquid exchange minimum. Governs both spot & derivative entry gates.
 MIN_POSITION_SIZE_USD = 10
@@ -258,3 +268,36 @@ MAX_CANDIDATES_PER_CYCLE = int(os.getenv('MAX_CANDIDATES_PER_CYCLE', '20'))
 
 # Candle fetch inter-call sleep
 CANDLE_FETCH_INTER_CALL_SLEEP_SEC = float(os.getenv('CANDLE_FETCH_SLEEP', '0.1'))
+
+# === SPOT ALLOCATION SLOTS (length-locked to the spot position cap) ===
+# Equal-weight spot slots, derived from the spot position cap so the two can
+# never drift. The old fixed-length [0.30,0.30,0.40] silently sized any slot
+# index >= len to 0 — which is why a naive MAX_OPEN_POSITIONS bump alone would
+# NOT yield more positions. Each spot position sizes to
+#   slot_pct × STRATEGY_POOL_SPLIT["spot"] × capital
+#   = (1/_n_spot) × spot_pool × capital  (= 20% equity at _n_spot=5, pool=1.0).
+# This overrides the literal in the SPOT dict above.
+_n_spot = MAX_OPEN_POSITIONS_PER_STRATEGY["spot"]
+SPOT["allocation_split"] = [round(1.0 / _n_spot, 6)] * _n_spot
+
+# Loud-fail guard against future misconfig: more spot slots than allocation
+# weights would silently size the extra slots to 0 (the bug above).
+assert len(SPOT["allocation_split"]) >= MAX_OPEN_POSITIONS_PER_STRATEGY["spot"], (
+    "allocation_split shorter than spot position cap -> slots beyond len would "
+    "silently size to 0"
+)
+
+# Log the effective live sizing config once at import so production logs show
+# exactly what is deployed (defaults vs .env overrides).
+try:
+    from loguru import logger as _cfg_logger
+    _cfg_logger.info(
+        "Sizing config: MAX_OPEN_POSITIONS={} spot_cap={} STRATEGY_POOL_SPLIT={} "
+        "allocation_split={}",
+        MAX_OPEN_POSITIONS,
+        MAX_OPEN_POSITIONS_PER_STRATEGY["spot"],
+        STRATEGY_POOL_SPLIT,
+        SPOT["allocation_split"],
+    )
+except Exception:  # logging must never break config import
+    pass

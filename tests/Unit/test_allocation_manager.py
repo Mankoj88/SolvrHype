@@ -108,34 +108,35 @@ class TestPoolUsageDerivedFromPositions:
         om = _FakeOM()
         am = AllocationManager(order_manager=om)
         capital = 125.74
+        # Config-driven (pool split is env-configurable): capacity = capital × spot pool.
+        spot_cap = capital * STRATEGY_POOL_SPLIT["spot"]
         assert am.pool_used("spot") == 0.0
-        # capacity = capital × 0.50 ≈ 62.87
-        assert am.pool_capacity("spot", capital) == pytest.approx(
-            capital * STRATEGY_POOL_SPLIT["spot"]
-        )
-        assert am.pool_capacity("spot", capital) == pytest.approx(62.87)
+        assert am.pool_capacity("spot", capital) == pytest.approx(spot_cap)
 
     def test_one_position_reduces_capacity(self):
         from execution.allocation_manager import AllocationManager
+        from config import STRATEGY_POOL_SPLIT
         om = _FakeOM()
         am = AllocationManager(order_manager=om)
         capital = 125.74
+        spot_cap = capital * STRATEGY_POOL_SPLIT["spot"]
         _add_spot(om, "SOL", 20.0)
         assert am.pool_used("spot") == pytest.approx(20.0)
-        # 62.87 - 20 = 42.87
-        assert am.pool_capacity("spot", capital) == pytest.approx(42.87)
+        assert am.pool_capacity("spot", capital) == pytest.approx(spot_cap - 20.0)
 
     def test_closed_position_frees_pool_no_leak(self):
         from execution.allocation_manager import AllocationManager
+        from config import STRATEGY_POOL_SPLIT
         om = _FakeOM()
         am = AllocationManager(order_manager=om)
         capital = 125.74
+        spot_cap = capital * STRATEGY_POOL_SPLIT["spot"]
         _add_spot(om, "SOL", 20.0)
-        assert am.pool_capacity("spot", capital) == pytest.approx(42.87)
+        assert am.pool_capacity("spot", capital) == pytest.approx(spot_cap - 20.0)
         # Position closes → removed from the live book → usage vanishes.
         om.positions.pop("SOL", None)
         assert am.pool_used("spot") == 0.0
-        assert am.pool_capacity("spot", capital) == pytest.approx(62.87)
+        assert am.pool_capacity("spot", capital) == pytest.approx(spot_cap)
 
     def test_partial_tp_frees_proportional_share(self):
         """Selling half (remaining_size_coin halved) frees half the pool."""
@@ -169,3 +170,75 @@ class TestPoolUsageDerivedFromPositions:
         am = AllocationManager(order_manager=om)
         _add_spot(om, "SOL", 20.0)
         assert am.calculate_position_size("SOL", 2000.0, "spot") == 0
+
+
+class TestSpotScaleUpFiveSlots:
+    """Behavioral validation for the 5-concurrent-spot scale-up at 100% capital.
+
+    With STRATEGY_POOL_SPLIT["spot"]=1.0 and 5 equal slots, each spot position
+    sizes to (1/5) × 1.0 × capital = 20% equity. The 5th slot must be reachable
+    and the 6th blocked. These assertions are config-driven so they hold under
+    any spot-cap / pool override (env rollback) — they read the live config and
+    skip when the deployed config is not the 5-slot / 100% target.
+    """
+
+    def _cfg(self):
+        from config import (
+            STRATEGY_POOL_SPLIT, MAX_OPEN_POSITIONS_PER_STRATEGY, SPOT,
+            MIN_POSITION_SIZE_USD,
+        )
+        n_spot = MAX_OPEN_POSITIONS_PER_STRATEGY["spot"]
+        if n_spot != 5 or STRATEGY_POOL_SPLIT["spot"] != 1.0:
+            pytest.skip(
+                "Spot scale-up assertions target the 5-slot / 100%-pool config; "
+                f"deployed config is spot_cap={n_spot} "
+                f"pool={STRATEGY_POOL_SPLIT['spot']}"
+            )
+        return STRATEGY_POOL_SPLIT, n_spot, SPOT, MIN_POSITION_SIZE_USD
+
+    def test_each_of_five_slots_sizes_to_20pct_equity(self):
+        """(a) With 0..4 existing spot positions, the next spot size ≈ 25.6 on
+        a 128 pool (20% equity) and stays above the exchange minimum."""
+        from execution.allocation_manager import AllocationManager
+        split, n_spot, _spot, min_usd = self._cfg()
+        capital = 128.0
+        per_slot = capital * split["spot"] / n_spot  # 25.6
+        for existing in range(n_spot):  # 0..4
+            om = _FakeOM()
+            am = AllocationManager(order_manager=om)
+            for i in range(existing):
+                _add_spot(om, f"HELD{i}", per_slot)
+            size = am.calculate_position_size("NEW", capital, "spot")
+            assert size == pytest.approx(per_slot, abs=0.01), (
+                f"{existing} held → expected {per_slot}, got {size}"
+            )
+            assert size > min_usd
+
+    def test_sixth_position_blocked_when_five_filled(self):
+        """(b) With all 5 slots filled, the pool is exhausted → next size 0,
+        proving the 5th slot is reachable and the 6th blocked."""
+        from execution.allocation_manager import AllocationManager
+        split, n_spot, _spot, _min = self._cfg()
+        capital = 128.0
+        per_slot = capital * split["spot"] / n_spot
+        om = _FakeOM()
+        am = AllocationManager(order_manager=om)
+        for i in range(n_spot):  # fill all 5
+            _add_spot(om, f"HELD{i}", per_slot)
+        assert am.calculate_position_size("NEW", capital, "spot") == 0
+
+    def test_pool_capacity_decreases_toward_zero_as_slots_fill(self):
+        """(c) pool_capacity("spot", 128) steps down to ~0 as positions fill."""
+        from execution.allocation_manager import AllocationManager
+        split, n_spot, _spot, _min = self._cfg()
+        capital = 128.0
+        per_slot = capital * split["spot"] / n_spot
+        om = _FakeOM()
+        am = AllocationManager(order_manager=om)
+        expected_full = capital * split["spot"]
+        assert am.pool_capacity("spot", capital) == pytest.approx(expected_full)
+        for i in range(n_spot):
+            _add_spot(om, f"HELD{i}", per_slot)
+            remaining = expected_full - (i + 1) * per_slot
+            assert am.pool_capacity("spot", capital) == pytest.approx(remaining, abs=0.01)
+        assert am.pool_capacity("spot", capital) == pytest.approx(0.0, abs=0.01)

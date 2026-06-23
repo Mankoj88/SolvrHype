@@ -65,18 +65,21 @@ def test_state_file_remains_valid_json_under_rapid_writes(patched_sdk, isolate_s
 
 def test_per_strategy_count_stays_accurate(patched_sdk, isolate_state_dir):
     from execution.order_manager import OrderManager
+    from config import MAX_OPEN_POSITIONS
 
     om = OrderManager()
 
-    for i in range(3):
+    # Fill every global slot with spot positions. Count is config-driven so this
+    # holds under any MAX_OPEN_POSITIONS override (env rollback).
+    for i in range(MAX_OPEN_POSITIONS):
         sig = _mk_spot_signal(f"SPOT{i}", price=50.0)
-        om.execute_entry(sig, 100.0)
+        assert om.execute_entry(sig, 100.0), f"spot entry {i} should succeed"
 
     counts = om.open_position_count_by_strategy()
-    assert counts["spot"] == 3 and counts["derivative"] == 0, counts
+    assert counts["spot"] == MAX_OPEN_POSITIONS and counts["derivative"] == 0, counts
 
     sig_d = _mk_deriv_signal("DERIVA", price=100.0, sl=95.0)
-    # Max 3 open enforced → 4th entry rejected
+    # At MAX_OPEN_POSITIONS → next entry (any strategy) rejected by the global cap.
     ok = om.execute_entry(sig_d, 80.0)
     assert ok is False, "Should reject when at MAX_OPEN_POSITIONS"
 
