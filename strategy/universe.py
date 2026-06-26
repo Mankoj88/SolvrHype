@@ -24,6 +24,9 @@ class UniverseFetcher:
         self._info = info or Info(get_api_url(), skip_ws=True)
         self._cache: list[tuple[str, dict]] = []
         self._cache_time: float = 0
+        # Last _cache_time already snapshotted — dedup guard so one refresh does
+        # not double-write (see _refresh hook below). Purely observability state.
+        self._last_snapshot_cache_time: float = 0
 
     def iter_assets(self):
         """Generator yield (asset_name, ctx). Refresh otomatis jika cache expired."""
@@ -59,3 +62,17 @@ class UniverseFetcher:
         self._cache = result
         self._cache_time = time.time()
         logger.info(f"Universe refreshed: {len(result)} aset tradeable")
+
+        # Best-effort market-context snapshot for offline backtesting. Fully
+        # isolated: the cache is already set above, and write_ctx_snapshot never
+        # raises, but the try/except is a hard belt-and-suspenders guarantee that
+        # NOTHING here can affect refresh / scan / entries. Dedup guard skips a
+        # repeat write for a cache_time already snapshotted by this instance.
+        if getattr(self, "_last_snapshot_cache_time", None) != self._cache_time:
+            try:
+                from monitoring.ctx_snapshot import write_ctx_snapshot
+                write_ctx_snapshot(result)
+            except Exception as e:
+                logger.warning(f"ctx snapshot hook failed (non-fatal): {e}")
+            finally:
+                self._last_snapshot_cache_time = self._cache_time

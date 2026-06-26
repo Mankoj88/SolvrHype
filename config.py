@@ -257,6 +257,13 @@ DATA_DIR.mkdir(exist_ok=True)
 LOGS_DIR.mkdir(exist_ok=True)
 DB_PATH = DATA_DIR / "solvira.db"
 
+# === OBSERVABILITY / CAPTURE ===
+# Per-refresh market ctx + regime snapshots to daily JSONL for offline backtesting.
+# Best-effort and FULLY isolated: a write failure never affects universe refresh,
+# scanning, or entries. Toggle off via .env (CAPTURE_CTX_SNAPSHOTS=false).
+CAPTURE_CTX_SNAPSHOTS = os.getenv("CAPTURE_CTX_SNAPSHOTS", "true").lower() == "true"
+CTX_SNAPSHOT_DIR = DATA_DIR / "ctx_snapshots"
+
 # === API URLs ===
 def get_api_url() -> str:
     if USE_TESTNET:
