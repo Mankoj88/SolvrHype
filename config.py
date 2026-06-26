@@ -135,9 +135,9 @@ SPOT = {
     "volume_burst_multiplier": 1.5,
     "volume_burst_min_bars": 1,
     "volume_burst_max_bars": 10,
-    "cutloss_pct": -2.0,
+    "cutloss_pct": -1.0,
     # (tp_pct, sell_fraction_of_remaining, post_action)
-    "take_profits": [(2.0, 0.50, "breakeven"), (5.0, 1.00, None)],
+    "take_profits": [(1.75, 0.50, "breakeven"), (2.75, 1.00, None)],
     "max_hold_hours": 6.0,
     "leverage": 1,
     "allocation_split": [0.30, 0.30, 0.40],  # 1-3 aset
