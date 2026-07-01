@@ -827,7 +827,18 @@ class OrderManager:
 
                 if pct_change >= tp_pct:
                     is_last_tp = (i == len(pos.tp_levels_remaining) - 1)
-                    self._execute_partial_tp(asset, sell_pct, tp_pct, current_price, is_last_tp)
+                    ok = self._execute_partial_tp(asset, sell_pct, tp_pct, current_price, is_last_tp)
+                    if not ok:
+                        # Nothing was sold (None/failed/errored market_close).
+                        # Leave tp_levels_remaining AND the SL UNCHANGED so this
+                        # TP is retried on the next management cycle — never mark
+                        # it done or move SL to breakeven on a phantom fill.
+                        logger.warning(
+                            f"TP +{tp_pct}% for {asset} not executed — "
+                            f"tp_levels/SL unchanged, will retry next cycle"
+                        )
+                        break
+
                     pos.tp_levels_remaining = pos.tp_levels_remaining[i+1:]
 
                     if post_action == "breakeven" or (
@@ -849,14 +860,34 @@ class OrderManager:
             self._save_state()
 
     def _execute_partial_tp(self, asset: str, sell_pct: float, tp_label: float,
-                             current_price: float, is_last_tp: bool = False):
-        """sell_pct adalah fraksi dari CURRENT remaining_size_coin (bukan original size)."""
+                             current_price: float, is_last_tp: bool = False) -> bool:
+        """Execute one partial take-profit. `sell_pct` is a fraction of the CURRENT
+        remaining_size_coin (not the original size).
+
+        Returns True ONLY when the sell is acknowledged by the exchange
+        (result is a dict with status == "ok") — and ONLY then advances
+        tp_hit_count / remaining_size_coin and records the partial to the DB.
+
+        On ANY unacknowledged sell — a None return (the SDK returns None when the
+        coin is no longer in assetPositions), a non-dict result, status != "ok",
+        or an exception — it logs a clear warning, makes NO state change, does NOT
+        raise into manage_open_positions, and returns False so the caller retries
+        the TP on the next management cycle instead of falsely marking it done or
+        moving SL to breakeven on a phantom fill.
+
+        This mirrors the Bug C discipline (never advance state on an unconfirmed
+        exchange action). It intentionally does NOT re-query szi to confirm the
+        reduction the way _close_full_position does: a partial sell is not
+        idempotent, so a false-negative from a lagged user_state read would make
+        the next cycle sell an ADDITIONAL fraction (over-sell). Full closes are
+        reduce_only and safe to retry-until-flat; partials are not. See STEP 3
+        note in test_partial_tp_guard.py."""
         pos = self.positions[asset]
         size_to_sell = self._round_size(asset, pos.remaining_size_coin * sell_pct)
 
         if size_to_sell <= 0:
             logger.warning(f"TP size rounded to 0 for {asset}, skipping")
-            return
+            return False
 
         next_count = pos.tp_hit_count + 1
         tp_label_str = f"tp{next_count}"
@@ -872,27 +903,37 @@ class OrderManager:
             else:
                 self._on_position_close_partial(asset, current_price, tp_label_str, size_to_sell)
             pos.remaining_size_coin -= size_to_sell
-            return
+            return True
 
         try:
             result = self.exchange.market_close(asset, sz=size_to_sell)
-            if result.get("status") != "ok":
-                logger.error(f"TP execution failed: {result}")
-                return
-
-            pos.tp_hit_count = next_count
-            if is_last_tp:
-                self._on_position_close_full(asset, current_price, tp_label_str)
-            else:
-                self._on_position_close_partial(asset, current_price, tp_label_str, size_to_sell)
-
-            pos.remaining_size_coin -= size_to_sell
-            logger.info(
-                f"✅ TP_HIT {asset} +{tp_label}%: sold {size_to_sell}, "
-                f"remaining {pos.remaining_size_coin:.4f}"
-            )
         except Exception as e:
-            logger.exception(f"TP execution failed: {e}")
+            logger.warning(
+                f"⚠️ TP execution for {asset} raised (intended sell {size_to_sell} "
+                f"@ +{tp_label}%): {e} — TP NOT advanced, retry next cycle"
+            )
+            return False
+
+        if not isinstance(result, dict) or result.get("status") != "ok":
+            logger.warning(
+                f"⚠️ TP execution NOT confirmed for {asset} (intended sell "
+                f"{size_to_sell} @ +{tp_label}%, result={result!r}) — nothing sold, "
+                f"TP NOT advanced, retry next cycle"
+            )
+            return False
+
+        pos.tp_hit_count = next_count
+        if is_last_tp:
+            self._on_position_close_full(asset, current_price, tp_label_str)
+        else:
+            self._on_position_close_partial(asset, current_price, tp_label_str, size_to_sell)
+
+        pos.remaining_size_coin -= size_to_sell
+        logger.info(
+            f"✅ TP_HIT {asset} +{tp_label}%: sold {size_to_sell}, "
+            f"remaining {pos.remaining_size_coin:.4f}"
+        )
+        return True
 
     def _update_stop_loss(self, pos: Position, new_sl_price: float):
         if pos.sl_oid:
